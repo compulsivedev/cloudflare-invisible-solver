@@ -36,7 +36,7 @@ The decode pass (L1) is the key unlock: it exposes the SHA-256 constants, the RS
 Two functions form the core. Both operate on the **global object graph**.
 
 ### 2a. Property enumerator — `aM(obj)` (`decoded.js:8202`)
-Walks the whole prototype chain collecting **every** own-property name:
+Walks the whole prototype chain collecting **enumerable own keys** at every level:
 ```js
 function aM(obj) {
   var names = [];
@@ -47,42 +47,73 @@ function aM(obj) {
   return names;
 }
 ```
+The **caller** (§2c) then unions `Object.getOwnPropertyNames(H)` (own, incl. non-enumerable) onto this list and de-dupes.
 *(Corrected: the enumerator uses `Object.keys`, not `getOwnPropertyNames` — the first draft mislabeled these due to the rotation bug.)*
 
 ### 2b. Value type-classifier — `aP(natives, value)` (`decoded.js:7025`)
 Maps each property's **value** to a single category char (helper-object calls inlined):
 ```js
 function aP(natives, v) {
-  if (v == null)              return v === undefined ? 'u' : 'x';
+  if (v == null)            return v === undefined ? 'u' : 'x';   // undefined / null
   var t = typeof v;
-  if (t === 'object') { try { if (natives.Promise && v instanceof natives.Promise) { v.then(()=>{}); return 'p'; } } catch(e){} }
-  return Array.isArray(v)            ? 'a'
-       : v === natives.Array         ? 'D'            // the Array constructor itself
-       : v === true                  ? 'T'
-       : v === false                 ? 'F'
-       : t === 'object'
-           ? (v instanceof natives.Number && natives.Number.prototype.valueOf.call(v) > 0 ? 'N' : 'f')
-           : (typeCharLookup[t] || '?');              // 'string'→…, 'number'→… via aK[]
+  if (t === 'object') {                                           // Promise instance?
+    try { if (natives.Promise && v instanceof natives.Promise) { v.catch(()=>{}); return 'p'; } } catch (e) {}
+  }
+  return Array.isArray(v)      ? 'a'                               // array
+       : v === natives.Array   ? 'D'                               // the Array constructor itself
+       : v === true            ? 'T'
+       : v === false           ? 'F'
+       : t === 'function'                                         // native vs user-defined function
+           ? (v instanceof natives.Function
+              && natives.Function.prototype.toString.call(v).indexOf('[native code]') > 0 ? 'N' : 'f')
+       : (aK[t] || '?');                                          // else: typeof-keyed table (aK)
 }
+// aK (typeof → char), decoded.js:2553-2559:
+//   object→'o'   string→'s'   undefined→'u'   symbol→'z'   number→'n'   bigint→'I'
 ```
+
+**Category legend (corrected):**
+
+| char | meaning | char | meaning |
+|------|---------|------|---------|
+| `u` | `undefined` | `o` | object (non-Promise, non-array, non-null) |
+| `x` | `null` | `s` | string |
+| `p` | Promise instance | `z` | symbol |
+| `a` | array (`Array.isArray`) | `n` | number |
+| `D` | the `Array` constructor itself | `I` | bigint |
+| `T` / `F` | boolean `true` / `false` | `i` | inaccessible (getter threw — set in §2c) |
+| `N` | **native** function (`[native code]`) | `?` | unknown `typeof` |
+| `f` | non-native (user) function | | |
+
+*(Corrected from the first draft: `N` is a native function and `f` a user function — not `Number`/generic-object; and `s/z/n/I` were missing.)*
 
 ### 2c. Collection loop (`decoded.js:2618-2666`)
 ```js
-var keys = aM(H);                       // all property names of the target (window/navigator/document/…)
-keys = dedupe(sort(keys));              // sort + drop adjacent dups (decoded.js:2626-2635)
+var keys = aM(H);                                  // enumerable keys up the prototype chain (§2a)
+if (Object.getOwnPropertyNames)                    // + own (incl. non-enumerable) names of H
+  keys = keys.concat(Object.getOwnPropertyNames(H));
+keys = Array.from(new Set(keys));                  // dedupe (Set, or a sort+splice fallback)
 var out = {};
-for (var i = 0; i < keys.length; i++) {
-  var name = keys[i];
+for (var name of keys) {
   try {
-    var cat = aP(natives, H[name]);     // classify the value's type  ← single aP call site (decoded.js:2641)
-    bucket(cat, name);                  // out[cat] = out[cat]||[]; out[cat].push(name)   (decoded.js:2660)
-  } catch (e) { bucket('i', name); }    // inaccessible → category 'i'
+    var v   = H[name];
+    var cat = aP(natives, v);                       // classify the value (§2b)   ← decoded.js:2641
+    if (cat === 'n' || cat === 's' || cat === 'a') {            // ["n","s","a"].includes(cat)
+      var num = +v, isNumericString = (cat === 's') && (num === num);
+      if (name === 'd.cookie')   bucket(name, cat);             // cookie: bucket by category only
+      else if (!isNumericString) bucket(name, v);               // else bucket under the LITERAL value
+      // (numeric-looking strings are dropped)
+    } else {
+      bucket(name, cat);                            // bucket under the category char
+    }
+  } catch (e) { bucket(name, 'i'); }                // inaccessible getter → 'i'
 }
-return out;                             // { category : [propNames…] }
+// bucket(name, key): out[key] = out[key] || []; out[key].push(name)   (decoded.js:2660)
+return out;                                         // { <value-or-category> : [propName…] }
 ```
 A companion pass (`R["aPlZu"]`, `decoded.js:2670`) builds the baseline/expected map and prefixes the object bucket with `'o.'` (`decoded.js:2692`).
 
-**Result shape:** `{ "<categoryChar>": ["<propName>", …], … }` — i.e. browser-environment probing where *the set of properties that resolve to each value-type* is the fingerprint. This is exactly the structure of the repo's JSD `wb_result`.
+**Result shape:** `{ "<value-or-categoryChar>": ["<propName>", …], … }`. Crucially, the bucket **key** is the value's *category char* for most types, but the **literal value** itself for numbers/arrays/non-numeric strings (e.g. `outerWidth` buckets under `"158"`, `n.vendor` under `"Google Inc."`). This is exactly the structure — and the value-keyed quirk — of the repo's JSD `wb_result` in `utils/fingerprint.py`.
 
 ---
 
@@ -93,7 +124,7 @@ Globals set at `decoded.js:2697-2745`:
 | Symbol | Value | Meaning |
 |--------|-------|---------|
 | `aj` | `D9nyKPm+ZdgzraW-e3NEo4Hp76GXsU52jIVuRtwcxlfi$YC10QkqMOSFbvBTA8LhJ` (65 chars) | custom base64/lz alphabet — matches repo regex `[a-zA-Z0-9+\-$]{65}` |
-| `ag` | `BigInt('0x00e9d3dca1328a49…ebfb')` (2048-bit) | **RSA modulus N** |
+| `ag` | `BigInt('0x00e9d3dca1328a49…ebfb')` (1024-bit) | **RSA modulus N** |
 | `ae` | `BigInt(65537)` | **RSA public exponent e** (0x10001) |
 | SHA-256 K[64] | `[1116352408, 1899447441, …]` (`decoded.js:9662`) | SHA-256 round constants |
 | SHA-256 H[8] | `[1779033703, 3144134277, …]` (`decoded.js:9663`) | SHA-256 init state |
@@ -115,7 +146,7 @@ var base = m % N, e = 65537n, c = 1n;
 for (; e > 0n; e >>= 1n) { if (e & 1n) c = c*base % N; base = base*base % N; }
 var bytes = toBigEndian128(c);          // 128-byte ciphertext  (decoded.js:2736-2744)
 ```
-i.e. **RSA-2048 encryption of a random 128-byte buffer** — public-key key/nonce transport.
+i.e. **RSA-1024 encryption of a random 128-byte buffer** — public-key key/nonce transport.
 
 ### Step 4 — custom-alphabet base64 (`decoded.js:2900-2937`)
 Classic 3-byte→4-symbol base64 over `aj`, packing each 3 bytes into a 24-bit int then emitting 4 sextets (decimals like `& 63.42` are `ToInt32`-truncated no-ops), with the standard 1-/2-byte tail handling at `decoded.js:2925-2936`:
@@ -135,7 +166,7 @@ Encodes the RSA ciphertext bytes (and other binary blobs) for transport.
 ```
 i.e. `…/flow/ov1/<token-triple>/<ray>/…`. A sibling `…/b/ov1/<token-triple>/<ray>/` POST is built at `decoded.js:2311`. The resulting token is posted back to the parent `api.js` via `postMessage`.
 
-**Pipeline (primitives, recovered + verified):** `fingerprintMap → JSON → SHA-256(hex)` and `RSA-2048(random 128-byte buffer) → custom-base64`. **Orchestration boundary:** the exact field-by-field assembly of the `/flow/ov` body and its dispatch are driven by the **L5 JSVMP bytecode** (`runProgram`, `decoded.js:8410`) plus encrypted-string telemetry events (`R["XbnH2"]('<b64>$<b64>')`, `R["qcNv7"](…)`); these are not fully reducible to static JS without executing/lifting the bytecode (see §5).
+**Pipeline (primitives, recovered + verified):** `fingerprintMap → JSON → SHA-256(hex)` and `RSA-1024(random 128-byte buffer) → custom-base64`. **Orchestration boundary:** the exact field-by-field assembly of the `/flow/ov` body and its dispatch are driven by the **L5 JSVMP bytecode** (`runProgram`, `decoded.js:8410`) plus encrypted-string telemetry events (`R["XbnH2"]('<b64>$<b64>')`, `R["qcNv7"](…)`); these are not fully reducible to static JS without executing/lifting the bytecode (see §5).
 
 ---
 
@@ -148,10 +179,10 @@ i.e. `…/flow/ov1/<token-triple>/<ray>/…`. A sibling `…/b/ov1/<token-triple
 | Object bucket | `"o": [...]` | `'o.' + name` prefix (`decoded.js:2692`) |
 | Alphabet | 65-char `[a-zA-Z0-9+\-$]{65}` per challenge | **same family** — `aj` (65 chars, incl. `+ - $`) |
 | Transport encoding | **lz-string LZW**, 6-bit codes via `key[code]` (`_lzw_encode_to_key_chars`) | **custom-alphabet base64** for the crypto bytes (lz-string-style compression of the JSON is likely present too; same alphabet family) |
-| Crypto | none beyond the lz encode | **adds RSA-2048 (e=65537)** key transport + **SHA-256** hashing |
+| Crypto | none beyond the lz encode | **adds RSA-1024 (e=65537)** key transport + **SHA-256** hashing |
 | Endpoint | `/cdn-cgi/challenge-platform/h/b/jsd/r/<jsd><ray>` | `/cdn-cgi/challenge-platform/h/<b>/flow/ov…` |
 
-**Bottom line:** Turnstile's fingerprinting is the *same algorithm family* as the JSD code already in the repo (enumerate → type-classify → bucket → 65-char-alphabet encode). The material **difference** is the payload-protection layer: Turnstile wraps the result with **SHA-256 + RSA-2048 hybrid encryption** and submits over **XHR to `/flow/ov`**, whereas the repo's JSD path lz-string-encodes and posts to `/jsd/r/`.
+**Bottom line:** Turnstile's fingerprinting is the *same algorithm family* as the JSD code already in the repo (enumerate → type-classify → bucket → 65-char-alphabet encode). The material **difference** is the payload-protection layer: Turnstile wraps the result with **SHA-256 + RSA-1024 hybrid encryption** and submits over **XHR to `/flow/ov`**, whereas the repo's JSD path lz-string-encodes and posts to `/jsd/r/`.
 
 ---
 

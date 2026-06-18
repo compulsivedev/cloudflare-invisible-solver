@@ -56,7 +56,7 @@ const enc = b64enc(sample);
 const rt = b64dec(enc);
 const rtOk = JSON.stringify(rt) === JSON.stringify(sample);
 
-// ---------- 2. RSA-2048 modexp (faithful transcription of the square-and-multiply) ----------
+// ---------- 2. RSA-1024 modexp (faithful transcription of the square-and-multiply) ----------
 const N = BigInt(
   "0x00e9d3dca1328a49ad3403e4badda37a6a13610b608b5099839e1074e720f5a33b2ebd8c2ffd12c09be0015a4635aa9d2022d8f72f90ed11610c3742b0baef5b7da73d7e79aff6cdbdeab72492ce0a858e4c1f4c27a14ebbb4ce3beacfda982fe74463e76f654aab0c597d5e73686ea149023e8f60ae6365a30055fe2c5eb2ebfb"
 );
@@ -100,7 +100,7 @@ function fromBE(bytes) {
   return x;
 }
 const msgBytes = Array.from({ length: 128 }, (_, i) => (i * 7 + 3) & 0xff);
-msgBytes[0] = 0; // source sets p5[0]=0 so m < N
+msgBytes[0] = 1; // source forces p5[0]=1 so m's top byte (0x01) < N's (0xe9) => m < N
 const m = fromBE(msgBytes);
 const cRec = modpowRecovered(m, e, N);
 const cRef = modpowRef(m, e, N);
