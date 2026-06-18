@@ -115,6 +115,8 @@ A companion pass (`R["aPlZu"]`, `decoded.js:2670`) builds the baseline/expected 
 
 **Result shape:** `{ "<value-or-categoryChar>": ["<propName>", …], … }`. Crucially, the bucket **key** is the value's *category char* for most types, but the **literal value** itself for numbers/arrays/non-numeric strings (e.g. `outerWidth` buckets under `"158"`, `n.vendor` under `"Google Inc."`). This is exactly the structure — and the value-keyed quirk — of the repo's JSD `wb_result` in `utils/fingerprint.py`.
 
+**Live collector (TODO 2).** The `aM`/`aP`/bucket loop (`gpLd0`) is ported faithfully to [`collect-fingerprint.js`](collect-fingerprint.js) and run over a real Chromium global graph via CDP by `utils.turnstile_fingerprint.collect_fingerprint()` (or `CfSolver.collect_turnstile_fingerprint()`), producing this exact map for `build_flow_ov_body`. The VM driver that selects the enumerated **roots + prefixes** is bytecode-driven (JSVMP dispatch) and not statically recoverable; the collector's `DEFAULT_ROOTS` are reconstructed from the recovered evidence — `d.cookie` → `document` (`d.`), `n.vendor` → `navigator` (`n.`), `outerWidth` bucketed unprefixed → `window` (`""`) — and overridable via `roots`. A live capture round-trips through `build_flow_ov_body` byte-for-byte.
+
 ---
 
 ## 3. Payload generation pipeline
