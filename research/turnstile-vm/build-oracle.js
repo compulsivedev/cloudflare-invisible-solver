@@ -69,11 +69,19 @@ var am = BigInt(2);
 var aS = BigInt(8);
 var aE = BigInt('0xff');
 
-// KJuRf8 -- 16-byte key-whitening applied to the XTEA key slice (decoded.js:2884).
-// This symbol is NOT defined anywhere in the captured bundle (it is an external /
-// companion-script global). For verification we use identity; the Python port
-// exposes the same hook so both sides agree. Override via env to test guesses.
-var KJuRf8 = function (a) { return a; };
+// KJuRf8 -- transform applied to the XTEA key slice (decoded.js:2884). RESOLVED:
+// it is a repeating-key XOR  out[i] = in[i] ^ s.charCodeAt(i % s.length).  The key
+// s is assembled at runtime from the obfuscator string-table (not a static literal
+// in the bundle); it was recovered live by calling the global KJuRf8(new
+// Uint8Array(16)) over CDP and verified against two independent /flow/ov captures.
+// Both sides (this oracle + utils.turnstile.make_kjurf8) use the same key so the
+// byte-for-byte harness validates the real transform. Override via KJURF8_KEY env.
+var KJURF8_KEY = process.env.KJURF8_KEY || 'ENdhiMvjWPEYrXrp';
+var KJuRf8 = function (a) {
+  var out = new Uint8Array(a.length);
+  for (var i = 0; i < a.length; i++) out[i] = a[i] ^ KJURF8_KEY.charCodeAt(i % KJURF8_KEY.length);
+  return out;
+};
 
 // ---- deterministic per-request random buffer p5 (normally crypto.getRandomValues) ----
 // Fixed so the oracle is reproducible. p5[0] forced to 1 then 0 exactly as the bundle does.
