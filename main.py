@@ -70,6 +70,30 @@ class CfSolver:
         logger.error("Error happened while solving cloudflare.")
         return False
 
+    def collect_turnstile_fingerprint(
+        self,
+        challenge_website: str,
+        *,
+        cdp_url: str = "http://localhost:29229",
+        roots: Optional[List[Dict[str, str]]] = None,
+    ) -> Dict[str, List[str]]:
+        """Collect a live env-probe ``fingerprint`` for :meth:`get_turnstile_solution`.
+
+        Runs the recovered ``aM``/``aP``/bucket collector in a real Chromium over CDP
+        (see ``utils/turnstile_fingerprint.py``) against ``challenge_website`` and
+        returns the bucket map. This replaces hand-authoring the fingerprint (TODO 2):
+
+            fp = solver.collect_turnstile_fingerprint("https://example.com")
+            solver.get_turnstile_solution(site, cf_chl_opt, token, fp)
+
+        Requires ``playwright`` and a browser exposing a CDP endpoint at ``cdp_url``.
+        """
+        from utils import turnstile_fingerprint
+
+        return turnstile_fingerprint.collect_fingerprint(
+            challenge_website, cdp_url=cdp_url, roots=roots
+        )
+
     def get_turnstile_solution(
         self,
         challenge_website: str,

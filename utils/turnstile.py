@@ -845,10 +845,11 @@ class TurnstileSolver:
         constants: Optional[TurnstileConstants] = None,
         bundle: Optional[Union[str, bytes, os.PathLike]] = None,
     ) -> None:
-        # TODO(dynamic): `fingerprint` must be the live env-probe bucket map produced
-        # by aM (enumerate) -> aP (classify) -> bucket over the real browser global
-        # graph (window/navigator/document/...). It cannot be hand-authored reliably;
-        # collect it from a real Chromium context or by executing the VM.
+        # `fingerprint` is the live env-probe bucket map produced by aM (enumerate)
+        # -> aP (classify) -> bucket over the real browser global graph
+        # (window/navigator/document/...). It cannot be hand-authored reliably; collect
+        # it from a real Chromium context via utils.turnstile_fingerprint.collect_fingerprint
+        # (faithful JS port: research/turnstile-vm/collect-fingerprint.js). See TODO 2.
         self.fingerprint = fingerprint
         # Per-load constants: extract fresh from a bundle when given, else use an
         # explicit set, else fall back to the captured-bundle DEFAULT_CONSTANTS.
@@ -883,9 +884,15 @@ class TurnstileSolver:
 #      all change per Turnstile version. Now auto-extracted from a fresh bundle via
 #      research/turnstile-vm/extract-constants.js -> load_constants_from_bundle() +
 #      apply_constants() (pass `bundle=` to TurnstileSolver).
-#   2. The fingerprint bucket map must be enumerated/classified over a REAL browser
-#      global graph (aM/aP) -- it cannot be statically hardcoded like the JSD map and
-#      stay correct across UA/version.
+#   2. [DONE] The fingerprint bucket map must be enumerated/classified over a REAL
+#      browser global graph (aM/aP) -- it cannot be statically hardcoded like the JSD
+#      map and stay correct across UA/version. The aM/aP/bucket loop (gpLd0) is ported
+#      faithfully to research/turnstile-vm/collect-fingerprint.js and run live over CDP
+#      via utils.turnstile_fingerprint.collect_fingerprint() (or
+#      CfSolver.collect_turnstile_fingerprint()). The VM's exact enumerated root set +
+#      prefixes are bytecode-driven (JSVMP dispatch); the collector's DEFAULT_ROOTS are
+#      reconstructed from the recovered evidence (d.cookie->document, n.vendor->navigator,
+#      outerWidth unprefixed->window) and overridable via `roots`.
 #   3. [DONE] KJuRf8 (decoded.js:2884) is a repeating-key XOR on the XTEA key slice.
 #      Resolved + verified against live ground truth; it is carried as
 #      `TurnstileConstants.kjurf8_key` and applied via `apply_constants()` to the
