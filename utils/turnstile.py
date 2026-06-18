@@ -98,6 +98,14 @@ _DEFAULT_RSA_E = 65537
 _DEFAULT_ROTATION_K = 421
 _DEFAULT_TABLE_LEN = 1821
 _DEFAULT_DECODER_OFFSET = 114
+# KJuRf8 XOR key ``s`` (decoded.js:2884): the repeating-key XOR applied to the
+# 16-byte XTEA key slice. Recovered live by calling ``KJuRf8(new Uint8Array(16))``
+# over CDP -- a zero input returns ``s`` directly because the transform is
+# ``out[i] = in[i] ^ s.charCodeAt(i % s.length)``. It is assembled at runtime from
+# the obfuscator string-table (NOT a static literal in the bundle), so unlike the
+# alphabet/RSA literals it cannot be pulled from the AST -- re-probe live for a new
+# deployment. Verified against two independent live /flow/ov captures.
+_DEFAULT_KJURF8_KEY = b"ENdhiMvjWPEYrXrp"  # == bytes.fromhex("454e6468694d766a5750455972587270")
 
 
 def _rsa_key_size(modulus: int) -> int:
@@ -111,14 +119,7 @@ ALPHABET = _DEFAULT_ALPHABET
 RSA_N = _DEFAULT_RSA_N
 RSA_E = _DEFAULT_RSA_E
 RSA_KEY_SIZE = _rsa_key_size(_DEFAULT_RSA_N)  # bytes (128 == 1024-bit)
-
-# KJuRf8 XOR key ``s`` (decoded.js:2884). Recovered live by calling the global
-# ``KJuRf8(new Uint8Array(16))`` over CDP -- it returns ``s`` directly because the
-# transform is ``out[i] = in[i] ^ s.charCodeAt(i % s.length)`` and a zero input
-# yields the key bytes. Stable across loads for this deployment; re-extract live
-# for a different sitekey/version (it is built at runtime from the string-table and
-# is NOT a static literal in the bundle). Verified against live ground truth.
-KJURF8_KEY = b"ENdhiMvjWPEYrXrp"  # == bytes.fromhex("454e6468694d766a5750455972587270")
+KJURF8_KEY = _DEFAULT_KJURF8_KEY
 
 # Value-classifier category chars produced by `aP` (decoded.js:7025) + the `aK`
 # typeof table (decoded.js:2553). See report section 2b for the full legend.
@@ -166,6 +167,10 @@ class TurnstileConstants:
     rotation_k: Optional[int] = None
     table_len: Optional[int] = None
     decoder_offset: Optional[int] = None
+    # The XTEA-key-slice XOR transform `s`. Not extractable from the bundle AST
+    # (built at runtime from the string-table); defaults to the captured key and
+    # must be re-probed live via `KJuRf8(new Uint8Array(16))` for a new deployment.
+    kjurf8_key: bytes = _DEFAULT_KJURF8_KEY
     warnings: Tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -182,6 +187,8 @@ class TurnstileConstants:
             raise ValueError(f"rsa_n is only {self.rsa_n.bit_length()} bits (<512); extraction likely wrong")
         if self.rsa_e <= 1 or (self.rsa_e & 1) == 0:
             raise ValueError(f"rsa_e must be an odd integer > 1, got {self.rsa_e}")
+        if not isinstance(self.kjurf8_key, (bytes, bytearray)) or not self.kjurf8_key:
+            raise ValueError("kjurf8_key must be non-empty bytes")
         return self
 
 
@@ -193,6 +200,7 @@ DEFAULT_CONSTANTS = TurnstileConstants(
     rotation_k=_DEFAULT_ROTATION_K,
     table_len=_DEFAULT_TABLE_LEN,
     decoder_offset=_DEFAULT_DECODER_OFFSET,
+    kjurf8_key=_DEFAULT_KJURF8_KEY,
 )
 
 
@@ -264,6 +272,19 @@ def load_constants_from_bundle(
 
     if data.get("rsa_n_hex") is None:
         raise ValueError(f"extractor could not find RSA modulus; warnings={data.get('warnings')}")
+    # KJuRf8's key is assembled at runtime from the string-table, so it is not in the
+    # AST the extractor walks. If the bundle reports one, use it; otherwise fall back
+    # to the captured default and flag that it should be re-probed live.
+    kj_hex = data.get("kjurf8_key_hex")
+    if kj_hex:
+        kjurf8_key = bytes.fromhex(kj_hex)
+        kj_warnings: Tuple[str, ...] = ()
+    else:
+        kjurf8_key = _DEFAULT_KJURF8_KEY
+        kj_warnings = (
+            "kjurf8_key not extractable from bundle (runtime-assembled); using captured "
+            "default -- re-probe live via KJuRf8(new Uint8Array(16)) for a new deployment",
+        )
     consts = TurnstileConstants(
         alphabet=data.get("alphabet"),
         rsa_n=int(data["rsa_n_hex"], 16),
@@ -271,7 +292,8 @@ def load_constants_from_bundle(
         rotation_k=data.get("rotation_k"),
         table_len=data.get("table_len"),
         decoder_offset=data.get("decoder_offset"),
-        warnings=tuple(data.get("warnings") or ()),
+        kjurf8_key=kjurf8_key,
+        warnings=tuple(data.get("warnings") or ()) + kj_warnings,
     )
     return consts.validate()
 
@@ -296,22 +318,23 @@ def _resolve_bundle_path(bundle: Union[str, bytes, os.PathLike]) -> Optional[str
 def apply_constants(consts: TurnstileConstants) -> TurnstileConstants:
     """Swap the active per-load constants used by the verified primitives.
 
-    Updates the module globals (``ALPHABET``/``RSA_N``/``RSA_E``/``RSA_KEY_SIZE``)
-    that :func:`custom_b64encode`, :func:`rsa_block`, etc. read at call time.
-    Returns the applied set.
+    Updates the module globals (``ALPHABET``/``RSA_N``/``RSA_E``/``RSA_KEY_SIZE``/
+    ``KJURF8_KEY``) that :func:`custom_b64encode`, :func:`rsa_block`,
+    :func:`make_kjurf8`, etc. read at call time. Returns the applied set.
     """
-    global ALPHABET, RSA_N, RSA_E, RSA_KEY_SIZE
+    global ALPHABET, RSA_N, RSA_E, RSA_KEY_SIZE, KJURF8_KEY
     consts.validate()
     ALPHABET = consts.alphabet
     RSA_N = consts.rsa_n
     RSA_E = consts.rsa_e
     RSA_KEY_SIZE = consts.rsa_key_size
+    KJURF8_KEY = bytes(consts.kjurf8_key)
     return consts
 
 
 def active_constants() -> TurnstileConstants:
     """Snapshot the constants currently applied to the module globals."""
-    return TurnstileConstants(alphabet=ALPHABET, rsa_n=RSA_N, rsa_e=RSA_E)
+    return TurnstileConstants(alphabet=ALPHABET, rsa_n=RSA_N, rsa_e=RSA_E, kjurf8_key=KJURF8_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -642,14 +665,18 @@ def _xtea_encrypt(plaintext: bytes, base_keys: List[int]) -> bytes:
     return bytes(out)
 
 
-def make_kjurf8(xor_key: bytes = KJURF8_KEY) -> Callable[[bytes], bytes]:
+def make_kjurf8(xor_key: Optional[bytes] = None) -> Callable[[bytes], bytes]:
     """Build ``KJuRf8`` (decoded.js:2884): a repeating-key XOR over ``xor_key``.
 
     The live global is ``function(k){ for i: out[i] = k[i] ^ s[i % s.length]; }``.
     For the 16-byte XTEA key slice the key is applied straight (``len(s) == 16``).
-    Pass the bytes returned by the live ``KJuRf8(new Uint8Array(16))`` probe to
-    target a different deployment; defaults to the captured-and-verified key.
+    ``xor_key`` defaults to the active :data:`KJURF8_KEY` (resolved at call time, so
+    :func:`apply_constants` swaps it in alongside the alphabet/RSA modulus). Pass the
+    bytes returned by a live ``KJuRf8(new Uint8Array(16))`` probe to target a
+    different deployment without mutating the module globals.
     """
+    if xor_key is None:
+        xor_key = KJURF8_KEY
     if not xor_key:
         raise ValueError("KJuRf8 xor_key must be non-empty")
 
@@ -860,10 +887,14 @@ class TurnstileSolver:
 #      global graph (aM/aP) -- it cannot be statically hardcoded like the JSD map and
 #      stay correct across UA/version.
 #   3. [DONE] KJuRf8 (decoded.js:2884) is a repeating-key XOR on the XTEA key slice.
-#      Resolved + verified against live ground truth; `make_kjurf8()` / KJURF8_KEY are
-#      the default. The key is built at runtime from the string-table (not a static
-#      literal), so for a new deployment re-extract it live via the CDP one-liner
-#      `KJuRf8(new Uint8Array(16))` and pass the bytes to `make_kjurf8`.
+#      Resolved + verified against live ground truth; it is carried as
+#      `TurnstileConstants.kjurf8_key` and applied via `apply_constants()` to the
+#      `KJURF8_KEY` global that `make_kjurf8()` (and thus the default body builder)
+#      reads -- so `TurnstileSolver(..., constants=)` swaps it in alongside the
+#      alphabet/RSA modulus. The key is built at runtime from the string-table (not a
+#      static literal), so the AST extractor cannot recover it: for a new deployment
+#      re-probe it live via `KJuRf8(new Uint8Array(16))` and pass the bytes as
+#      `TurnstileConstants(..., kjurf8_key=...)` (or `make_kjurf8(bytes)` directly).
 #   4. _cf_chl_opt tokens (SvTRd8 / wKbN9 / TJERQ4) and the embedded <num>:<ts>:<token>
 #      triple are per-load; scrape them from the challenge page / iframe at solve time.
 # ===========================================================================
