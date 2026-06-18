@@ -124,6 +124,17 @@ function inlineLiterals(ast) {
       if (!binding) {
         return;
       }
+      // This assignment must be the binding's ONLY value source. Otherwise a
+      // later reassignment (`x = 5; x = 10; use(x)`) would inline the wrong
+      // literal -- allRefsAfter only checks reference *positions*, not that no
+      // other assignment reaches them. (VariableDeclarator uses binding.constant
+      // for the same reason; the assignment case must check constantViolations.)
+      if (binding.constantViolations.length !== 1 || binding.constantViolations[0].node !== path.node) {
+        return;
+      }
+      if (binding.path.isVariableDeclarator() && binding.path.node.init) {
+        return;
+      }
       if (typeof path.node.start === "number" && !allRefsAfter(binding, path.node.start)) {
         return;
       }
