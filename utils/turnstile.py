@@ -50,31 +50,60 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
-from typing import Any, Dict, List, Optional, Union
+import subprocess
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
-# Version-pinned constants captured from one Turnstile VM bundle.
-# These rotate per challenge version -- re-extract from a fresh bundle with the
-# scripts under research/turnstile-vm/ (decode-strings.js + derive-rotation.js).
+# Per-load / version-pinned constants.
+#
+# The RSA modulus, `aj` alphabet and string-table rotation all rotate across
+# Turnstile versions. They are NOT meant to be hardcoded for a real solve --
+# extract them fresh from a captured bundle with
+# ``research/turnstile-vm/extract-constants.js`` and apply them via
+# :func:`load_constants_from_bundle` + :func:`apply_constants` (or pass a bundle
+# to ``TurnstileSolver``). The literals below are the values captured from the
+# one analysed bundle; they back :data:`DEFAULT_CONSTANTS` and serve only as the
+# offline default that the verification harness (verify_body.py) pins against.
 # ---------------------------------------------------------------------------
 
 # Custom base64 alphabet (`aj`). Same family as the JSD alphabet -- it matches the
 # repo regex `[a-zA-Z0-9+\-$]{65}` in utils/constants.py (ENC_KEY_RE). 65th char is
 # unused by the encoder (no padding is emitted), so only indices 0..63 are reachable.
-ALPHABET = "D9nyKPm+ZdgzraW-e3NEo4Hp76GXsU52jIVuRtwcxlfi$YC10QkqMOSFbvBTA8LhJ"
+_DEFAULT_ALPHABET = "D9nyKPm+ZdgzraW-e3NEo4Hp76GXsU52jIVuRtwcxlfi$YC10QkqMOSFbvBTA8LhJ"
 
 # RSA public key (`ag` / `ae`). 1024-bit modulus; the literal carries a redundant
 # leading 0x00 byte. e = 0x10001.
-RSA_N = int(
+_DEFAULT_RSA_N = int(
     "00e9d3dca1328a49ad3403e4badda37a6a13610b608b5099839e1074e720f5a3"
     "3b2ebd8c2ffd12c09be0015a4635aa9d2022d8f72f90ed11610c3742b0baef5b"
     "7da73d7e79aff6cdbdeab72492ce0a858e4c1f4c27a14ebbb4ce3beacfda982f"
     "e74463e76f654aab0c597d5e73686ea149023e8f60ae6365a30055fe2c5eb2ebfb",
     16,
 )
-RSA_E = 65537
-RSA_KEY_SIZE = 128  # bytes (1024-bit)
+_DEFAULT_RSA_E = 65537
+# Load-time string-table rotation K + decoder offset captured from the same bundle
+# (derived by executing the obfuscator's checksum shuffler; see extract-constants.js).
+_DEFAULT_ROTATION_K = 421
+_DEFAULT_TABLE_LEN = 1821
+_DEFAULT_DECODER_OFFSET = 114
+
+
+def _rsa_key_size(modulus: int) -> int:
+    """RSA block size in bytes = byte length of the modulus (128 for 1024-bit)."""
+    return (modulus.bit_length() + 7) // 8
+
+
+# Active per-load constants used by the verified primitives below. They read these
+# module globals at call time, so :func:`apply_constants` swaps the whole set in.
+ALPHABET = _DEFAULT_ALPHABET
+RSA_N = _DEFAULT_RSA_N
+RSA_E = _DEFAULT_RSA_E
+RSA_KEY_SIZE = _rsa_key_size(_DEFAULT_RSA_N)  # bytes (128 == 1024-bit)
 
 # Value-classifier category chars produced by `aP` (decoded.js:7025) + the `aK`
 # typeof table (decoded.js:2553). See report section 2b for the full legend.
@@ -96,6 +125,178 @@ CATEGORY = {
     "inaccessible": "i",
     "unknown": "?",
 }
+
+
+# ---------------------------------------------------------------------------
+# Per-load constant loading (Task 2)
+#
+# The values above rotate per Turnstile version. `extract-constants.js` pulls a
+# fresh set straight out of a captured bundle's AST (alphabet/RSA literals are
+# inline; the string-table rotation is derived by executing the obfuscator's own
+# checksum shuffler). This module shells out to that script and applies the result
+# so the verified primitives operate on the live values -- nothing is hardcoded
+# for a real solve.
+# ---------------------------------------------------------------------------
+
+_EXTRACTOR_JS = Path(__file__).resolve().parent.parent / "research" / "turnstile-vm" / "extract-constants.js"
+
+
+@dataclass(frozen=True)
+class TurnstileConstants:
+    """Per-load constants extracted from one Turnstile VM bundle."""
+
+    alphabet: str
+    rsa_n: int
+    rsa_e: int
+    rotation_k: Optional[int] = None
+    table_len: Optional[int] = None
+    decoder_offset: Optional[int] = None
+    warnings: Tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def rsa_key_size(self) -> int:
+        return _rsa_key_size(self.rsa_n)
+
+    def validate(self) -> "TurnstileConstants":
+        """Raise if the set is structurally unusable for the body builder."""
+        if not isinstance(self.alphabet, str) or len(self.alphabet) != 65:
+            raise ValueError(f"alphabet must be 65 chars, got {len(self.alphabet or '')!r}")
+        if not isinstance(self.rsa_n, int) or self.rsa_n <= 0:
+            raise ValueError("rsa_n must be a positive integer modulus")
+        if self.rsa_n.bit_length() < 512:
+            raise ValueError(f"rsa_n is only {self.rsa_n.bit_length()} bits (<512); extraction likely wrong")
+        if self.rsa_e <= 1 or (self.rsa_e & 1) == 0:
+            raise ValueError(f"rsa_e must be an odd integer > 1, got {self.rsa_e}")
+        return self
+
+
+# The captured-bundle default; backs the offline path and the verification harness.
+DEFAULT_CONSTANTS = TurnstileConstants(
+    alphabet=_DEFAULT_ALPHABET,
+    rsa_n=_DEFAULT_RSA_N,
+    rsa_e=_DEFAULT_RSA_E,
+    rotation_k=_DEFAULT_ROTATION_K,
+    table_len=_DEFAULT_TABLE_LEN,
+    decoder_offset=_DEFAULT_DECODER_OFFSET,
+)
+
+
+def load_constants_from_bundle(
+    bundle: Union[str, bytes, os.PathLike],
+    *,
+    node_bin: str = "node",
+    extractor: Optional[Union[str, os.PathLike]] = None,
+    timeout: float = 120.0,
+) -> TurnstileConstants:
+    """Extract a fresh :class:`TurnstileConstants` set from a captured bundle.
+
+    ``bundle`` may be a path to a ``.js`` file, or the raw source as ``str``/``bytes``
+    (written to a temp file for the subprocess). Runs ``extract-constants.js`` with
+    Node; the script's ``@babel/*`` deps must be importable (the environment sets
+    ``NODE_PATH`` to the global module dir -- it is forwarded automatically).
+
+    Raises ``RuntimeError`` if the extractor fails and ``ValueError`` if the
+    extracted set is structurally invalid.
+    """
+    script = Path(extractor) if extractor is not None else _EXTRACTOR_JS
+    if not script.is_file():
+        raise FileNotFoundError(f"extractor not found: {script}")
+
+    tmp_path: Optional[str] = None
+    try:
+        bundle_path = _resolve_bundle_path(bundle)
+        if bundle_path is None:  # raw source -> temp file
+            src = bundle.encode("utf-8") if isinstance(bundle, str) else bytes(bundle)
+            fd, tmp_path = tempfile.mkstemp(suffix=".js", prefix="ts_bundle_")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(src)
+            bundle_path = tmp_path
+
+        env = os.environ.copy()
+        if "NODE_PATH" not in env:
+            # Best-effort: let `npm root -g` populate it so Babel resolves.
+            try:
+                root = subprocess.run(
+                    ["npm", "root", "-g"], capture_output=True, text=True, timeout=30
+                ).stdout.strip()
+                if root:
+                    env["NODE_PATH"] = root
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        proc = subprocess.run(
+            [node_bin, str(script), str(bundle_path)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout,
+        )
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"extract-constants.js failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"extractor produced non-JSON output: {proc.stdout[:200]!r}") from exc
+
+    if data.get("rsa_n_hex") is None:
+        raise ValueError(f"extractor could not find RSA modulus; warnings={data.get('warnings')}")
+    consts = TurnstileConstants(
+        alphabet=data.get("alphabet"),
+        rsa_n=int(data["rsa_n_hex"], 16),
+        rsa_e=int(data.get("rsa_e") or 0),
+        rotation_k=data.get("rotation_k"),
+        table_len=data.get("table_len"),
+        decoder_offset=data.get("decoder_offset"),
+        warnings=tuple(data.get("warnings") or ()),
+    )
+    return consts.validate()
+
+
+def _resolve_bundle_path(bundle: Union[str, bytes, os.PathLike]) -> Optional[str]:
+    """Return a filesystem path if ``bundle`` denotes one, else ``None`` (raw source)."""
+    if isinstance(bundle, (bytes, bytearray)):
+        return None
+    if isinstance(bundle, os.PathLike):
+        return os.fspath(bundle)
+    if isinstance(bundle, str):
+        # Treat as a path only if it looks like one and exists; otherwise raw source.
+        if "\n" not in bundle and len(bundle) < 4096:
+            try:
+                if os.path.isfile(bundle):
+                    return bundle
+            except OSError:
+                return None
+    return None
+
+
+def apply_constants(consts: TurnstileConstants) -> TurnstileConstants:
+    """Swap the active per-load constants used by the verified primitives.
+
+    Updates the module globals (``ALPHABET``/``RSA_N``/``RSA_E``/``RSA_KEY_SIZE``)
+    that :func:`custom_b64encode`, :func:`rsa_block`, etc. read at call time.
+    Returns the applied set.
+    """
+    global ALPHABET, RSA_N, RSA_E, RSA_KEY_SIZE
+    consts.validate()
+    ALPHABET = consts.alphabet
+    RSA_N = consts.rsa_n
+    RSA_E = consts.rsa_e
+    RSA_KEY_SIZE = consts.rsa_key_size
+    return consts
+
+
+def active_constants() -> TurnstileConstants:
+    """Snapshot the constants currently applied to the module globals."""
+    return TurnstileConstants(alphabet=ALPHABET, rsa_n=RSA_N, rsa_e=RSA_E)
 
 
 # ---------------------------------------------------------------------------
@@ -577,12 +778,26 @@ class TurnstileSolver:
     page's ``_cf_chl_opt`` tokens) -- see the TODOs at the bottom of the module.
     """
 
-    def __init__(self, fingerprint: Any) -> None:
+    def __init__(
+        self,
+        fingerprint: Any,
+        *,
+        constants: Optional[TurnstileConstants] = None,
+        bundle: Optional[Union[str, bytes, os.PathLike]] = None,
+    ) -> None:
         # TODO(dynamic): `fingerprint` must be the live env-probe bucket map produced
         # by aM (enumerate) -> aP (classify) -> bucket over the real browser global
         # graph (window/navigator/document/...). It cannot be hand-authored reliably;
         # collect it from a real Chromium context or by executing the VM.
         self.fingerprint = fingerprint
+        # Per-load constants: extract fresh from a bundle when given, else use an
+        # explicit set, else fall back to the captured-bundle DEFAULT_CONSTANTS.
+        # Always apply: the verified primitives read the module globals, so the
+        # default path must reset them too -- otherwise a prior solver built with
+        # bundle=/constants= would leave the globals pointing at its constants.
+        if bundle is not None and constants is None:
+            constants = load_constants_from_bundle(bundle)
+        self.constants = apply_constants(constants if constants is not None else DEFAULT_CONSTANTS)
 
     def build_submit_body(
         self,
@@ -604,9 +819,10 @@ class TurnstileSolver:
 # ===========================================================================
 # TODO -- per-load / version-pinned wiring required for an end-to-end solve:
 #
-#   1. RSA modulus N + custom alphabet (ALPHABET) + the VM string table & its
-#      load-time rotation all change per Turnstile version. Re-extract them from a
-#      fresh bundle using research/turnstile-vm/{decode-strings,derive-rotation}.js.
+#   1. [DONE] RSA modulus N + custom alphabet (ALPHABET) + the string-table rotation
+#      all change per Turnstile version. Now auto-extracted from a fresh bundle via
+#      research/turnstile-vm/extract-constants.js -> load_constants_from_bundle() +
+#      apply_constants() (pass `bundle=` to TurnstileSolver).
 #   2. The fingerprint bucket map must be enumerated/classified over a REAL browser
 #      global graph (aM/aP) -- it cannot be statically hardcoded like the JSD map and
 #      stay correct across UA/version.
