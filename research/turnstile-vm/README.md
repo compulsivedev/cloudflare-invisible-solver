@@ -19,6 +19,9 @@ and the verification results).
 | `decode-strings.js` | The decode pass: detects + executes the self-defending shuffler to derive the rotation, then inlines all `p(idx)` calls. |
 | `derive-rotation.js` | Standalone harness that runs the obfuscator's own checksum loop to prove the rotation offset (= 421). |
 | `verify-primitives.js` | Executes the recovered custom-base64 + RSA-2048 against test vectors. |
+| `build-oracle.js` | Surgically extracts the plain-JS body builder `pZ` (+ `an`/`av`/`aG`/`p0`-`p4`) from `decoded.js` into a runnable, parameterizable oracle (`oracle-body.js`, generated). |
+| `oracle-run.js` | Drives the oracle over stdin test cases, emitting every intermediate layer as hex. |
+| `verify_body.py` | Byte-for-byte check of the Python `/flow/ov` body builder (`utils/turnstile.build_flow_ov_body`) against the JS oracle, including the large-input `aG`/`p4` branches. |
 
 ## Reproduce
 
@@ -34,6 +37,10 @@ node decode-strings.js final.js decoded.js
 
 # 3. validate the recovered crypto primitives
 node verify-primitives.js
+
+# 4. verify the Python /flow/ov body builder byte-for-byte vs the JS oracle
+#    (regenerates oracle-body.js, then compares 200 small + 3 large random cases)
+python verify_body.py 200
 ```
 
 `final.js` itself is regenerated from `vm_raw.js` via the bundled skill:
@@ -47,7 +54,12 @@ node ../../.agents/skills/ast-deobfuscation/scripts/run-pipeline.js vm_raw.js ou
 - The bundle is **version-pinned** and embeds per-load tokens (`_cf_chl_opt`). The
   algorithm is stable across loads; the RSA modulus, alphabet, and string table (and
   its rotation) change per version.
-- A residual **JSVMP** layer (`runProgram` / `V3`) interprets base64 bytecode that drives
-  the exact `/flow/ov` body assembly; the fingerprint model + crypto primitives are fully
-  recovered and verified, but a byte-exact request body would require lifting/executing
-  that bytecode. See §5 of the write-up.
+- **Body-assembly gap is now closed.** The `/flow/ov` body is built by a plain-JS
+  function `pZ` (decoded.js:2746-2937); the `runProgram`/`V3` JSVMP at line 8410 only
+  returns the closure that *calls* `pZ` and fires the XHR. `pZ` is fully recovered,
+  ported to `utils/turnstile.py` (`build_flow_ov_body`), and verified byte-for-byte by
+  `verify_body.py` across the serialize -> LZW -> pad -> XTEA -> RSA-prepend -> custom-b64
+  chain (both the small `av`/`p3` and large `aG`/`p4` branches).
+- The only unresolved symbol is **`KJuRf8`** (decoded.js:2884), a 16-byte transform on
+  the XTEA key slice that is not defined in the captured bundle (an external/companion
+  global). The port exposes it as an injectable hook (identity by default).

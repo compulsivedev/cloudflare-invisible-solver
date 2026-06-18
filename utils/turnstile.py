@@ -1,4 +1,4 @@
-"""Turnstile challenge-VM payload primitives (scaffold).
+"""Turnstile challenge-VM payload primitives.
 
 Reverse-engineered from the Turnstile challenge *iframe* VM script -- the real
 fingerprinting / payload engine. (``api.js`` is only the loader/orchestrator and
@@ -8,20 +8,43 @@ verification of every primitive below live in
 
 This mirrors the JSD path already in the repo:
 
-    JSD        fingerprint map -> lz-string encode                       -> POST /jsd/r/
-    Turnstile  fingerprint map -> JSON -> SHA-256 + RSA(key) + base64(aj) -> POST /flow/ov
+    JSD        fingerprint map -> lz-string encode                  -> POST /jsd/r/
+    Turnstile  fingerprint map -> JSON -> LZW -> XTEA -> RSA -> b64  -> POST /flow/ov
 
-RECOVERED + VERIFIED (faithful, runnable -- see research/turnstile-vm/verify-primitives.js):
+The ``/flow/ov`` request *body* is built by the plain-JS function ``pZ``
+(decoded.js:2746-2937), NOT by the JSVMP bytecode: the ``runProgram`` interpreter
+(decoded.js:8410) only returns the closure that *calls* ``pZ`` and fires the XHR, so
+the whole body chain is recoverable as straight-line code. The chain ``pZ`` runs is:
+
+    serialize(fingerprint)            # an  : JSON.stringify-equivalent UTF-8 bytes
+      + append one 0x20 byte          #       H[V++] = aS<<am
+    -> LZW compress                   # av  : variable-width codes, 16-bit-word writer
+    -> zero-pad to an 8-byte boundary #       pad = (8 - len % 8) % 8
+    -> XTEA encrypt (per-block keys)  # p3  : 32-round XTEA, key = p5[9*pad+40 : +16]
+    -> blob = RSA_block(128) | pad-count byte | ciphertext
+    -> custom base64 over ``aj``      #       -> body string
+
+The 128-byte ``RSA_block`` transports the random buffer ``p5`` (with ``p5[0]=1``)
+that the XTEA key is sliced from, so the server recovers the symmetric key with its
+private key. SHA-256 exists in the bundle but is NOT part of this body chain.
+
+RECOVERED + VERIFIED byte-for-byte against the JS oracle
+(research/turnstile-vm/{build-oracle,oracle-run}.js, harness verify_body.py):
+    * UTF-8 JSON serializer ``an``              -> ``_serialize_an``
+    * LZW compressor ``av``                     -> ``_lzw_compress``
+    * XTEA key schedule / per-block keys / cipher -> ``_xtea_*``
+    * RSA-1024 key-transport block, e=65537     -> ``rsa_keytransport`` / ``rsa_block``
     * custom-alphabet base64 over ``aj``        -> ``custom_b64encode``
-    * RSA-1024 hybrid key transport, e=65537    -> ``rsa_keytransport``
-    * SHA-256 hex digest                        -> ``sha256_hex``
+    * full ``/flow/ov`` body assembly ``pZ``    -> ``build_flow_ov_body``
     * fingerprint value-classifier category model -> ``classify_value`` / ``CATEGORY``
     * /flow/ov endpoint construction            -> ``build_flow_ov_url``
 
-PER-LOAD / VERSION-PINNED -- must be re-extracted, see the TODOs at the bottom and
-in ``TurnstileSolver``. The constants below were captured from ONE bundle and rotate
-across Turnstile versions; the env-probe graph and the exact request *body* assembly
-are produced inside the VM (the body is driven by the residual JSVMP bytecode).
+PER-LOAD / VERSION-PINNED -- the RSA modulus, ``aj`` alphabet and string-table
+rotation rotate across Turnstile versions and must be re-extracted from a fresh
+bundle (see ``research/turnstile-vm/`` and the TODOs in ``TurnstileSolver``).
+The one unresolved external is ``KJuRf8`` (a 16-byte transform applied to the XTEA
+key slice at decoded.js:2884); it is not defined in the captured bundle, so the
+builder exposes it as an injectable hook that defaults to identity.
 """
 from __future__ import annotations
 
@@ -112,7 +135,8 @@ def custom_b64encode(data: bytes) -> str:
 def sha256_hex(data: Union[str, bytes]) -> str:
     """SHA-256 hex digest. The VM ships a canonical ``binb_sha256`` (constants
     verified at decoded.js:9662-9663); ``hashlib`` is the byte-identical stdlib
-    equivalent. Used for integrity/keying -- no PoW difficulty loop exists."""
+    equivalent. NOTE: SHA-256 is present in the bundle but is NOT part of the
+    ``/flow/ov`` body chain (kept here only for completeness)."""
     if isinstance(data, str):
         data = data.encode("utf-8")
     return hashlib.sha256(data).hexdigest()
@@ -143,6 +167,341 @@ def rsa_keytransport(key_buffer: Optional[bytes] = None) -> Dict[str, bytes]:
     c = pow(m, RSA_E, RSA_N)
     cipher = c.to_bytes(RSA_KEY_SIZE, "big")
     return {"key": key_buffer, "cipher": cipher}
+
+
+def rsa_block(random_buffer: bytes) -> bytes:
+    """The 128-byte RSA key-transport block prepended to the body (decoded.js:2713-2744).
+
+    Identical maths to :func:`rsa_keytransport` but takes the raw 128-byte
+    ``crypto.getRandomValues`` buffer (``p5``), forces ``buf[0]=1`` (so ``m < N``),
+    and returns only the big-endian ciphertext block ``c = m**e mod N``.
+    """
+    if len(random_buffer) != RSA_KEY_SIZE:
+        raise ValueError(f"random_buffer must be {RSA_KEY_SIZE} bytes")
+    buf = bytearray(random_buffer)
+    buf[0] = 1
+    m = int.from_bytes(bytes(buf), "big")
+    c = pow(m, RSA_E, RSA_N)
+    return c.to_bytes(RSA_KEY_SIZE, "big")
+
+
+# ---------------------------------------------------------------------------
+# /flow/ov body assembly  (decoded.js:2746-2937, function `pZ`)
+#
+# Every primitive below is a faithful port of the plain-JS body builder and is
+# checked byte-for-byte against the JS oracle by research/turnstile-vm/verify_body.py.
+# ---------------------------------------------------------------------------
+
+_U32 = 0xFFFFFFFF
+_XTEA_DELTA = 0x9E3779B9  # 2654435769
+
+# JSON string-escape map (`ao`, decoded.js:2705-2712): code point -> escape char byte.
+_ESCAPE = {8: 0x62, 9: 0x74, 10: 0x6E, 12: 0x66, 13: 0x72, 34: 0x22, 92: 0x5C}
+
+
+def _num_to_bytes(value: Union[int, float]) -> bytes:
+    """Mirror JS ``'' + number``. NaN / +-Infinity render as ``null`` (JSON.stringify)."""
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return b"null"
+        if value.is_integer():
+            return str(int(value)).encode("ascii")
+        return repr(value).encode("ascii")
+    return str(value).encode("ascii")
+
+
+def _serialize_an(value: Any, out: bytearray) -> None:
+    """Faithful port of ``an`` (decoded.js:7157-7402): a JSON.stringify-equivalent
+    UTF-8 serializer. Emits bytes into ``out``. Object/array members whose value is a
+    function (JS function/undefined/symbol/bigint) are dropped exactly as JSON does.
+
+    Caveat: JS ``for-in`` visits integer-like keys in ascending numeric order before
+    string keys; Python preserves dict insertion order. Real fingerprint maps use
+    non-integer string keys, so the orders coincide.
+    """
+    if value is None:
+        out += b"null"
+        return
+    if isinstance(value, bool):  # must precede int (bool is an int subclass)
+        out += b"true" if value else b"false"
+        return
+    if isinstance(value, (int, float)):
+        out += _num_to_bytes(value)
+        return
+    if isinstance(value, str):
+        out.append(0x22)
+        for ch in value:
+            cp = ord(ch)
+            if 32 <= cp <= 127 and cp != 34 and cp != 92:
+                out.append(cp)
+            elif cp in _ESCAPE:
+                out.append(0x5C)
+                out.append(_ESCAPE[cp])
+            elif cp < 32:
+                out += b"\\u" + ("%04x" % cp).encode("ascii")
+            else:
+                out += ch.encode("utf-8")
+        out.append(0x22)
+        return
+    if isinstance(value, (list, tuple)):
+        out.append(0x5B)  # [
+        for i, item in enumerate(value):
+            if i > 0:
+                out.append(0x2C)  # ,
+            before = len(out)
+            _serialize_an(item, out)
+            if len(out) == before:  # element serialized to nothing -> null
+                out += b"null"
+        out.append(0x5D)  # ]
+        return
+    if isinstance(value, dict):
+        out.append(0x7B)  # {
+        first = True
+        for key, val in value.items():
+            if callable(val):  # JS skips function/undefined/symbol/bigint values
+                continue
+            start = len(out)
+            if not first:
+                out.append(0x2C)  # ,
+            _serialize_an(str(key), out)
+            out.append(0x3A)  # :
+            after_key = len(out)
+            _serialize_an(val, out)
+            if after_key == len(out):  # value emitted nothing -> drop the pair
+                del out[start:]
+            else:
+                first = False
+        out.append(0x7D)  # }
+        return
+    # callables / anything else: emit nothing (mirrors `an` returning H unchanged)
+
+
+def _lzw_compress(data: List[int]) -> List[int]:
+    """Port of ``av`` (decoded.js:3383-3536): dictionary LZW with variable-width
+    codes and an MSB-first 16-bit-word bit writer. ``data`` is a list of byte ints;
+    returns the compressed byte list."""
+    out: List[int] = []
+    acc = 0       # Vl : bit accumulator
+    nbits = 0     # VH : bits buffered into the current 16-bit word (0..15)
+    width = 2     # VV : current code width
+    width_left = 2  # Va : codes left before the width grows
+
+    def emit(value: int, count: int) -> None:
+        nonlocal acc, nbits
+        for _ in range(count):
+            acc = ((acc << 1) | (value & 1)) & _U32
+            if nbits == 15:
+                out.append((acc >> 8) & 0xFF)
+                out.append(acc & 0xFF)
+                nbits = 0
+                acc = 0
+            else:
+                nbits += 1
+            value >>= 1
+
+    def grow() -> None:
+        nonlocal width, width_left
+        width_left -= 1
+        if width_left == 0:
+            width_left = 2 ** width
+            width += 1
+
+    single: Dict[int, int] = {}  # Y : byte value -> code
+    is_new: Dict[int, int] = {}  # V5: code -> 1 while still a fresh single char
+    pairs: Dict[int, int] = {}   # V6: 256*prev + cur -> code
+    next_code = 3                # Vp
+    w = 0                        # V7 : current code
+    last_byte = 0                # V8
+    started = False              # V9
+
+    for cur in data:
+        code = single.get(cur, 0)
+        if not code:
+            code = next_code
+            next_code += 1
+            single[cur] = code
+            is_new[code] = 1
+        if started:
+            key = 256 * w + cur
+            pc = pairs.get(key, 0)
+            if pc:
+                w = pc
+            else:
+                if is_new.get(w):
+                    emit(0, width)
+                    emit(last_byte, 8)
+                    grow()
+                    is_new[w] = 0
+                else:
+                    emit(w, width)
+                grow()
+                pairs[key] = next_code
+                next_code += 1
+                w = code
+                last_byte = cur
+        else:
+            w = code
+            last_byte = cur
+            started = True
+
+    if started:
+        if is_new.get(w):
+            emit(0, width)
+            emit(last_byte, 8)
+            grow()
+            is_new[w] = 0
+        else:
+            emit(w, width)
+        grow()
+    emit(2, width)
+
+    # flush the final partial word out to a 16-bit boundary (decoded.js:3502-3510)
+    while True:
+        acc = (acc << 1) & _U32
+        if nbits == 15:
+            out.append((acc >> 8) & 0xFF)
+            out.append(acc & 0xFF)
+            break
+        nbits += 1
+    return out
+
+
+def _xtea_round_keys(words: tuple) -> List[int]:
+    """``p0`` (decoded.js:4004): expand 4 key words into 64 XTEA subkeys
+    (``sum + key[sum & 3]`` / ``sum + key[(sum >> 11) & 3]``, delta 0x9E3779B9)."""
+    k = (words[0] & _U32, words[1] & _U32, words[2] & _U32, words[3] & _U32)
+    out: List[int] = []
+    s = 0
+    for _ in range(32):
+        out.append((s + k[s & 3]) & _U32)
+        s = (s + _XTEA_DELTA) & _U32
+        out.append((s + k[(s >> 11) & 3]) & _U32)
+    return out
+
+
+def _xtea_encrypt_block(v0: int, v1: int, subkeys: List[int]) -> tuple:
+    """``p2`` core (decoded.js:3706-3722): 32-round XTEA on one 64-bit block.
+
+    ``v0``/``v1`` are kept as exact Python ints (masked only inside the shifts and
+    XOR), exactly mirroring how the JS accumulates in doubles while ``+v`` uses the
+    unreduced value; only the low 32 bits ever reach the output.
+    """
+    i = 0
+    for _ in range(32):
+        t = ((((v1 & _U32) << 4) & _U32) ^ ((v1 & _U32) >> 5)) + v1
+        v0 = v0 + ((t & _U32) ^ subkeys[i])
+        i += 1
+        t = ((((v0 & _U32) << 4) & _U32) ^ ((v0 & _U32) >> 5)) + v0
+        v1 = v1 + ((t & _U32) ^ subkeys[i])
+        i += 1
+    return v0 & _U32, v1 & _U32
+
+
+def _xtea_block_keys(base_keys: List[int], block_index: int) -> List[int]:
+    """``p1`` (decoded.js:6898): fresh per-block subkeys, derived by XTEA-encrypting
+    the block counter ``(0, idx)`` and ``(0, idx+1)`` under the base schedule."""
+    w0, w1 = _xtea_encrypt_block(0, block_index & 0xFF, base_keys)
+    w2, w3 = _xtea_encrypt_block(0, (block_index + 1) & 0xFF, base_keys)
+    return _xtea_round_keys((w0, w1, w2, w3))
+
+
+def _xtea_encrypt(plaintext: bytes, base_keys: List[int]) -> bytes:
+    """``p3`` (decoded.js:7909): encrypt the padded plaintext block-by-block. Each
+    8-byte block (big-endian words) uses subkeys keyed by ``(offset >> 3) & 255``."""
+    out = bytearray()
+    cache: Dict[int, List[int]] = {}
+    for off in range(0, len(plaintext), 8):
+        bi = (off >> 3) & 0xFF
+        sub = cache.get(bi)
+        if sub is None:
+            sub = _xtea_block_keys(base_keys, bi)
+            cache[bi] = sub
+        v0 = (plaintext[off] << 24) | (plaintext[off + 1] << 16) | (plaintext[off + 2] << 8) | plaintext[off + 3]
+        v1 = (plaintext[off + 4] << 24) | (plaintext[off + 5] << 16) | (plaintext[off + 6] << 8) | plaintext[off + 7]
+        c0, c1 = _xtea_encrypt_block(v0, v1, sub)
+        out += bytes((
+            (c0 >> 24) & 0xFF, (c0 >> 16) & 0xFF, (c0 >> 8) & 0xFF, c0 & 0xFF,
+            (c1 >> 24) & 0xFF, (c1 >> 16) & 0xFF, (c1 >> 8) & 0xFF, c1 & 0xFF,
+        ))
+    return bytes(out)
+
+
+def build_flow_ov_body(
+    fingerprint: Any,
+    *,
+    random_buffer: Optional[bytes] = None,
+    kjurf8: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Assemble the byte-exact ``/flow/ov`` request body (``pZ``, decoded.js:2746-2937).
+
+    Args:
+        fingerprint: the enumerate->classify->bucket map (any JSON-serializable value).
+        random_buffer: the 128-byte ``crypto.getRandomValues`` buffer ``p5`` (the XTEA
+            key is sliced from it and it is RSA-transported to the server). Generated
+            fresh if omitted.
+        kjurf8: the unresolved external transform applied to the 16-byte XTEA key slice
+            (decoded.js:2884). Defaults to identity; pass a ``bytes -> bytes`` callable
+            to test a hypothesis.
+
+    Returns a dict with the final ``body`` string and every intermediate layer
+    (``json_bytes``, ``lzw``, ``pad``, ``plaintext_len``, ``rsa_block``, ``blob``) so
+    the port can be verified layer-by-layer against the JS oracle.
+    """
+    if kjurf8 is None:
+        kjurf8 = lambda b: b  # noqa: E731 - identity hook
+    if random_buffer is None:
+        random_buffer = secrets.token_bytes(RSA_KEY_SIZE)
+    if len(random_buffer) != RSA_KEY_SIZE:
+        raise ValueError(f"random_buffer must be {RSA_KEY_SIZE} bytes")
+    p5 = bytearray(random_buffer)
+
+    # 1) serialize fingerprint, then append the single 0x20 byte (H[V++] = aS<<am)
+    json_bytes = bytearray()
+    _serialize_an(fingerprint, json_bytes)
+    json_bytes.append(0x20)
+
+    # 2) LZW compress
+    lzw = _lzw_compress(list(json_bytes))
+
+    # 3) zero-pad the compressed stream to an 8-byte boundary
+    pad = (8 - (len(lzw) % 8)) % 8
+    plaintext = bytes(lzw) + b"\x00" * pad
+
+    # 4) RSA key-transport block (consumes p5 with p5[0]=1); VM restores p5[0]=0 after
+    pv = rsa_block(bytes(p5))
+    p5[0] = 0
+
+    # 5) XTEA key = KJuRf8(p5[9*pad+40 : +16]) -> 4 big-endian words -> key schedule
+    off = 9 * pad + 40
+    key16 = kjurf8(bytes(p5[off:off + 16]))
+    if len(key16) != 16:
+        raise ValueError("KJuRf8 must return 16 bytes")
+    words = (
+        int.from_bytes(key16[0:4], "big"),
+        int.from_bytes(key16[4:8], "big"),
+        int.from_bytes(key16[8:12], "big"),
+        int.from_bytes(key16[12:16], "big"),
+    )
+    base_keys = _xtea_round_keys(words)
+
+    # 6) encrypt the padded plaintext
+    ciphertext = _xtea_encrypt(plaintext, base_keys)
+
+    # 7) blob = RSA block (128B) | pad-count byte | ciphertext
+    blob = bytes(pv) + bytes((pad,)) + ciphertext
+
+    # 8) custom-alphabet base64 -> body string
+    body = custom_b64encode(blob)
+
+    return {
+        "body": body,
+        "json_bytes": bytes(json_bytes),
+        "lzw": bytes(lzw),
+        "pad": pad,
+        "plaintext_len": len(plaintext),
+        "rsa_block": bytes(pv),
+        "blob": blob,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -212,34 +571,34 @@ def build_flow_ov_url(challenge_website: str, cf_chl_opt: Dict[str, str], challe
 
 class TurnstileSolver:
     """Faithful scaffold of the Turnstile submit flow built on the verified
-    primitives above. It deliberately does NOT claim to produce a passing token:
-    the env-probe graph and the byte-exact ``/flow/ov`` body are produced inside
-    the version-pinned VM (the body is assembled by the residual JSVMP bytecode).
-    The TODOs below enumerate exactly what dynamic wiring remains.
+    primitives above. The ``/flow/ov`` request *body* is now fully recovered
+    (``build_flow_ov_body``); what remains for an end-to-end solve is dynamic
+    per-load data (a real env-probe fingerprint, fresh per-load constants, and the
+    page's ``_cf_chl_opt`` tokens) -- see the TODOs at the bottom of the module.
     """
 
-    def __init__(self, fingerprint: Dict[str, List[str]]) -> None:
+    def __init__(self, fingerprint: Any) -> None:
         # TODO(dynamic): `fingerprint` must be the live env-probe bucket map produced
         # by aM (enumerate) -> aP (classify) -> bucket over the real browser global
         # graph (window/navigator/document/...). It cannot be hand-authored reliably;
         # collect it from a real Chromium context or by executing the VM.
         self.fingerprint = fingerprint
 
-    def build_submit_body(self) -> Dict[str, str]:
-        """Build the recovered payload pieces. The field names/order of the real
-        request body are JSVMP-driven (see report section 5) and are left as a TODO."""
-        fp_json = build_fingerprint_payload(self.fingerprint)
-        digest = sha256_hex(fp_json)
-        kt = rsa_keytransport()
-        encrypted_key = custom_b64encode(kt["cipher"])
+    def build_submit_body(
+        self,
+        *,
+        random_buffer: Optional[bytes] = None,
+        kjurf8: Optional[Any] = None,
+    ) -> str:
+        """Build the byte-exact ``/flow/ov`` request body from the fingerprint map.
 
-        # TODO(dynamic): the symmetric `kt["key"]` is used by the VM to encrypt the
-        # fingerprint/telemetry blob; that symmetric step + the exact field layout of
-        # the body are assembled by the JSVMP bytecode and are not recovered here.
-        return {
-            "hash": digest,
-            "encrypted_key": encrypted_key,
-        }
+        Returns the custom-base64 body string POSTed to ``/flow/ov``. The full
+        intermediate-layer dict is available via :func:`build_flow_ov_body` if you
+        need to inspect/verify the chain.
+        """
+        return build_flow_ov_body(
+            self.fingerprint, random_buffer=random_buffer, kjurf8=kjurf8
+        )["body"]
 
 
 # ===========================================================================
@@ -251,9 +610,10 @@ class TurnstileSolver:
 #   2. The fingerprint bucket map must be enumerated/classified over a REAL browser
 #      global graph (aM/aP) -- it cannot be statically hardcoded like the JSD map and
 #      stay correct across UA/version.
-#   3. The exact /flow/ov request *body* (field names, order, the symmetric encryption
-#      of the blob) is assembled by the JSVMP bytecode interpreter (runProgram / V3)
-#      and would require lifting/executing that bytecode to reproduce byte-for-byte.
+#   3. KJuRf8 (decoded.js:2884) is an external 16-byte transform on the XTEA key slice
+#      that is NOT defined in the captured bundle. `build_flow_ov_body` exposes it as
+#      an injectable hook (identity by default); resolve it from the companion script
+#      for a server-acceptable body.
 #   4. _cf_chl_opt tokens (SvTRd8 / wKbN9 / TJERQ4) and the embedded <num>:<ts>:<token>
 #      triple are per-load; scrape them from the challenge page / iframe at solve time.
 # ===========================================================================

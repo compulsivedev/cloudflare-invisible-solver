@@ -25,9 +25,9 @@ This is the real engine the `api.js` loader injects — **not** `api.js` itself 
 | L2 "Scrambler" helper objects | per-function `Z["<rand>"]=function(a,b){return a==b}` then `Z["<rand>"](x,y)`; random-label keys (mixed into the same string table) | Identified; values readable |
 | L3 Master natives registry | params `l`/`R`; random-label keys map to real globals — e.g. `l["Array"]["isArray"](H)` = `Array.isArray(H)` | Identified |
 | L4 Control-flow flattening | `for(;;){ switch(seq[i++]){ case '0': … continue } }` with permuted case orders | Present (does not block algorithm recovery) |
-| L5 JSVMP (bytecode interpreter) | `R["runProgram"](program)` (`decoded.js:3063`) builds `new V3(program)` — a register-based VM (`vm.h` register file, `vm.g` PC, XOR-masked register indices) with a fetch-decode-execute loop; invoked with large base64 bytecode blobs (e.g. `decoded.js:8410`) | **Boundary** — see §3/§5 |
+| L5 JSVMP (bytecode interpreter) | `R["runProgram"](program)` (`decoded.js:3063`) builds `new V3(program)` — a register-based VM (`vm.h` register file, `vm.g` PC, XOR-masked register indices) with a fetch-decode-execute loop; invoked with large base64 bytecode blobs (e.g. `decoded.js:8410`) | Wraps only the **dispatch** closure; the body builder `pZ` it calls is plain JS and is fully recovered (§5) |
 
-The decode pass (L1) is the key unlock: it exposes the SHA-256 constants, the RSA modulus, the 65-char alphabet, the API/property strings, and the type-classifier. **However**, part of the high-level orchestration (including how the final flow body is assembled and when it is sent) executes inside the **L5 JSVMP** as interpreted bytecode, so the *primitives and fingerprint model* are fully recovered while the exact byte-level assembly of the `/flow/ov` body is partly behind the VM (see §5).
+The decode pass (L1) is the key unlock: it exposes the SHA-256 constants, the RSA modulus, the 65-char alphabet, the API/property strings, and the type-classifier. **Update:** the byte-level assembly of the `/flow/ov` body is **not** in the JSVMP — it is a plain-JS function `pZ` (`decoded.js:2746-2937`); the `runProgram`/`V3` call at `decoded.js:8410` only returns the closure that *calls* `pZ` and fires the XHR. `pZ` is now fully recovered, ported to `utils/turnstile.py`, and verified byte-for-byte (see §5).
 
 ---
 
@@ -166,7 +166,9 @@ Encodes the RSA ciphertext bytes (and other binary blobs) for transport.
 ```
 i.e. `…/flow/ov1/<token-triple>/<ray>/…`. A sibling `…/b/ov1/<token-triple>/<ray>/` POST is built at `decoded.js:2311`. The resulting token is posted back to the parent `api.js` via `postMessage`.
 
-**Pipeline (primitives, recovered + verified):** `fingerprintMap → JSON → SHA-256(hex)` and `RSA-1024(random 128-byte buffer) → custom-base64`. **Orchestration boundary:** the exact field-by-field assembly of the `/flow/ov` body and its dispatch are driven by the **L5 JSVMP bytecode** (`runProgram`, `decoded.js:8410`) plus encrypted-string telemetry events (`R["XbnH2"]('<b64>$<b64>')`, `R["qcNv7"](…)`); these are not fully reducible to static JS without executing/lifting the bytecode (see §5).
+**Pipeline (recovered + verified byte-for-byte):** the `/flow/ov` body is built by `pZ` (`decoded.js:2746-2937`) as
+`serialize(fp) → +0x20 → LZW(av/aG) → zero-pad to 8B → XTEA-ECB(p0/p1/p2/p3 ‖ p4) → prepend RSA-1024 block(p5,e,N) ‖ pad-count byte → custom-base64(aj)`.
+The XTEA key is `KJuRf8(p5[9·pad+40 : +16])` sliced from the same 128-byte buffer that the RSA block transports to the server. **Remaining boundary:** only the *dispatch* (which the `runProgram`/`V3` JSVMP closure at `decoded.js:8410` wraps) and encrypted-string telemetry events (`R["XbnH2"]`, `R["qcNv7"]`) stay in the VM; the body bytes themselves are fully reproduced in Python (see §5). The single unresolved symbol is `KJuRf8` (`decoded.js:2884`), an external 16-byte key transform exposed as an injectable hook (identity by default).
 
 ---
 
@@ -197,9 +199,10 @@ Run `node derive-rotation.js out/final.js` and `node verify-primitives.js`:
 | Float-noise (`>>18.89`, `&63.42`, `128.22<<`) | 100k random trials vs. integer ops | **identical** (operands coerce via `ToInt32`) |
 | RSA modexp + serialization | Transcribed square-and-multiply vs. an independent `modpow`; 128-byte big-endian round-trip | **matches** reference; `c < N`; BE round-trips |
 | SHA-256 | Constant + structure match | `K[64]`/`H[8]` are the canonical SHA-256 constants; padding `0x80 << (24 - len%32)` and length placement match `binb_sha256` |
+| **`/flow/ov` body builder (`pZ`)** | `build-oracle.js` surgically extracts `pZ`+`an`/`av`/`aG`/`p0`-`p4` from `decoded.js` into a parameterizable JS oracle; `verify_body.py` drives both it and the Python port (`utils/turnstile.build_flow_ov_body`) with identical random (seed, fingerprint) inputs and compares every layer | **byte-for-byte match** on 1200+ random cases across `json`/`lzw`/`pad`/`plaintext`/`rsa-block`/`blob`/`body`, incl. the large-input `aG`/`p4` branches (>16 KB) |
 
 ## 6. Caveats / boundaries
-- **L5 JSVMP is the main boundary.** `runProgram`/`V3` interpret base64 bytecode; the high-level *orchestration* (exact `/flow/ov` body field order, timing, and which telemetry events fire) lives in that bytecode and in encrypted string events (`XbnH2`/`qcNv7`). The **fingerprint model and crypto primitives** (this report) are fully recovered and verified, but a byte-exact reproduction of the request body would require lifting the bytecode or running the VM in an instrumented browser env.
+- **The `/flow/ov` body assembly is recovered** (`pZ`, plain JS) and verified byte-for-byte; it is **not** JSVMP-driven. The residual `runProgram`/`V3` JSVMP only wraps the *dispatch* closure (and encrypted telemetry events `XbnH2`/`qcNv7`); reproducing the body bytes does not require lifting the bytecode. The only unresolved symbol is **`KJuRf8`** (`decoded.js:2884`), an external 16-byte transform on the XTEA key slice (not defined in the captured bundle); the port exposes it as an injectable hook (identity by default).
 - The captured bundle is **version-pinned** and embeds per-load tokens (`_cf_chl_opt`: `SvTRd8`, ray `wKbN9`, `TJERQ4`, ts). The algorithm is stable across loads; constants (RSA `N`, alphabet, string table + its rotation) change per version.
 - L2/L3/L4 indirection remains in `decoded.js`; some method names on the natives registry are still random labels, but the classifier + crypto constants are unambiguous.
 - The earlier `aE` artifact is **resolved**: with the rotation applied it decodes to `BigInt("0xff")` (the byte mask in `Number(0xFF & x)` at `decoded.js:2742`).
