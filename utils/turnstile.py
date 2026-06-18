@@ -792,9 +792,12 @@ class TurnstileSolver:
         self.fingerprint = fingerprint
         # Per-load constants: extract fresh from a bundle when given, else use an
         # explicit set, else fall back to the captured-bundle DEFAULT_CONSTANTS.
+        # Always apply: the verified primitives read the module globals, so the
+        # default path must reset them too -- otherwise a prior solver built with
+        # bundle=/constants= would leave the globals pointing at its constants.
         if bundle is not None and constants is None:
             constants = load_constants_from_bundle(bundle)
-        self.constants = apply_constants(constants) if constants is not None else DEFAULT_CONSTANTS
+        self.constants = apply_constants(constants if constants is not None else DEFAULT_CONSTANTS)
 
     def build_submit_body(
         self,
