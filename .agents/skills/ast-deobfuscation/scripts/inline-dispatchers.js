@@ -28,10 +28,40 @@ function collectDispatcherValue(node, dispatcherMap) {
   return null;
 }
 
+function isMemberWriteTarget(path) {
+  const { node, parent } = path;
+  if (t.isAssignmentExpression(parent) && parent.left === node) {
+    return true;
+  }
+  if (t.isUpdateExpression(parent) && parent.argument === node) {
+    return true;
+  }
+  if (t.isUnaryExpression(parent) && parent.operator === "delete" && parent.argument === node) {
+    return true;
+  }
+  if ((t.isForInStatement(parent) || t.isForOfStatement(parent)) && parent.left === node) {
+    return true;
+  }
+  return false;
+}
+
+function collectMutatedObjects(ast) {
+  const mutated = new Set();
+  traverse(ast, {
+    MemberExpression(path) {
+      if (path.get("object").isIdentifier() && isMemberWriteTarget(path)) {
+        mutated.add(path.node.object.name);
+      }
+    }
+  });
+  return mutated;
+}
+
 function inlineDispatchers(ast) {
   let changed = false;
   const dispatcherMap = Object.create(null);
   const removableEntries = [];
+  const mutatedObjects = collectMutatedObjects(ast);
 
   traverse(ast, {
     VariableDeclarator(path) {
@@ -39,6 +69,13 @@ function inlineDispatchers(ast) {
         return;
       }
       const name = path.node.id.name;
+      if (mutatedObjects.has(name)) {
+        return;
+      }
+      const binding = path.scope.getBinding(name);
+      if (binding && binding.constantViolations.length > 0) {
+        return;
+      }
       const collected = dispatcherMap[name] || Object.create(null);
       let localChanged = false;
       let supportedPropertyCount = 0;
@@ -100,7 +137,7 @@ function inlineDispatchers(ast) {
       if (!entry) {
         return;
       }
-      if (entry.type === "literal") {
+      if (entry.type === "literal" && !isMemberWriteTarget(path)) {
         path.replaceWith(clone(entry.value));
         changed = true;
       }
