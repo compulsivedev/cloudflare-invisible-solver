@@ -18,6 +18,27 @@ function hasUnsafeContinue(bodyPath) {
   return found;
 }
 
+// An IIFE body may only be hoisted into the enclosing scope when it has no
+// parameters (an inlined `function(a){...}` would otherwise rebind `a` to the
+// outer scope instead of `undefined`) and contains no own-level `return` (which
+// would return from the *enclosing* function rather than just the IIFE).
+function canInlineIifeBody(funcPath) {
+  if (funcPath.node.params.length !== 0) {
+    return false;
+  }
+  let unsafe = false;
+  funcPath.get("body").traverse({
+    Function(path) {
+      path.skip();
+    },
+    ReturnStatement(path) {
+      unsafe = true;
+      path.stop();
+    }
+  });
+  return !unsafe;
+}
+
 function ensureBlock(path) {
   if (path.isBlockStatement()) {
     return path;
@@ -172,7 +193,11 @@ function normalize(ast) {
       if (!path.parentPath.isExpressionStatement()) {
         return;
       }
-      if (path.get("callee").isFunctionExpression() && path.node.arguments.length === 0) {
+      if (
+        path.get("callee").isFunctionExpression() &&
+        path.node.arguments.length === 0 &&
+        canInlineIifeBody(path.get("callee"))
+      ) {
         replaceStatementWithStatements(path.parentPath, path.node.callee.body.body);
         changed = true;
         return;
@@ -182,7 +207,8 @@ function normalize(ast) {
         path.get("callee.object").isFunctionExpression() &&
         path.get("callee.property").isIdentifier({ name: "call" }) &&
         path.node.arguments.length === 1 &&
-        path.get("arguments.0").isThisExpression()
+        path.get("arguments.0").isThisExpression() &&
+        canInlineIifeBody(path.get("callee.object"))
       ) {
         replaceStatementWithStatements(path.parentPath, path.node.callee.object.body.body);
         changed = true;
