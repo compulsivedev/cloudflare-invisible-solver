@@ -42,9 +42,16 @@ RECOVERED + VERIFIED byte-for-byte against the JS oracle
 PER-LOAD / VERSION-PINNED -- the RSA modulus, ``aj`` alphabet and string-table
 rotation rotate across Turnstile versions and must be re-extracted from a fresh
 bundle (see ``research/turnstile-vm/`` and the TODOs in ``TurnstileSolver``).
-The one unresolved external is ``KJuRf8`` (a 16-byte transform applied to the XTEA
-key slice at decoded.js:2884); it is not defined in the captured bundle, so the
-builder exposes it as an injectable hook that defaults to identity.
+
+``KJuRf8`` (the 16-byte transform applied to the XTEA key slice at decoded.js:2884)
+is RESOLVED: it is a repeating-key XOR ``key[i] ^ s[i % len(s)]`` with a 16-byte
+ASCII key ``s``. ``s`` is assembled at runtime from the obfuscator's string-table
+so it is not greppable in the bundle, but it is recovered directly by calling the
+live global ``KJuRf8(new Uint8Array(16))`` over CDP (which returns ``s`` itself).
+The value was verified against two independent live ``/flow/ov`` captures: both
+decrypt (RSA -> XTEA) to the identical, coherent LZW/JSON plaintext with correct
+zero-padding. ``s`` is stable across loads for a given deployment; :func:`make_kjurf8`
+builds the transform and :data:`KJURF8_KEY` is the captured default.
 """
 from __future__ import annotations
 
@@ -56,7 +63,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # Per-load / version-pinned constants.
@@ -104,6 +111,14 @@ ALPHABET = _DEFAULT_ALPHABET
 RSA_N = _DEFAULT_RSA_N
 RSA_E = _DEFAULT_RSA_E
 RSA_KEY_SIZE = _rsa_key_size(_DEFAULT_RSA_N)  # bytes (128 == 1024-bit)
+
+# KJuRf8 XOR key ``s`` (decoded.js:2884). Recovered live by calling the global
+# ``KJuRf8(new Uint8Array(16))`` over CDP -- it returns ``s`` directly because the
+# transform is ``out[i] = in[i] ^ s.charCodeAt(i % s.length)`` and a zero input
+# yields the key bytes. Stable across loads for this deployment; re-extract live
+# for a different sitekey/version (it is built at runtime from the string-table and
+# is NOT a static literal in the bundle). Verified against live ground truth.
+KJURF8_KEY = b"ENdhiMvjWPEYrXrp"  # == bytes.fromhex("454e6468694d766a5750455972587270")
 
 # Value-classifier category chars produced by `aP` (decoded.js:7025) + the `aK`
 # typeof table (decoded.js:2553). See report section 2b for the full legend.
@@ -627,6 +642,23 @@ def _xtea_encrypt(plaintext: bytes, base_keys: List[int]) -> bytes:
     return bytes(out)
 
 
+def make_kjurf8(xor_key: bytes = KJURF8_KEY) -> Callable[[bytes], bytes]:
+    """Build ``KJuRf8`` (decoded.js:2884): a repeating-key XOR over ``xor_key``.
+
+    The live global is ``function(k){ for i: out[i] = k[i] ^ s[i % s.length]; }``.
+    For the 16-byte XTEA key slice the key is applied straight (``len(s) == 16``).
+    Pass the bytes returned by the live ``KJuRf8(new Uint8Array(16))`` probe to
+    target a different deployment; defaults to the captured-and-verified key.
+    """
+    if not xor_key:
+        raise ValueError("KJuRf8 xor_key must be non-empty")
+
+    def _kjurf8(data: bytes) -> bytes:
+        return bytes(b ^ xor_key[i % len(xor_key)] for i, b in enumerate(data))
+
+    return _kjurf8
+
+
 def build_flow_ov_body(
     fingerprint: Any,
     *,
@@ -640,16 +672,17 @@ def build_flow_ov_body(
         random_buffer: the 128-byte ``crypto.getRandomValues`` buffer ``p5`` (the XTEA
             key is sliced from it and it is RSA-transported to the server). Generated
             fresh if omitted.
-        kjurf8: the unresolved external transform applied to the 16-byte XTEA key slice
-            (decoded.js:2884). Defaults to identity; pass a ``bytes -> bytes`` callable
-            to test a hypothesis.
+        kjurf8: the transform applied to the 16-byte XTEA key slice (decoded.js:2884),
+            a ``bytes -> bytes`` callable. Defaults to the resolved repeating-key XOR
+            (:func:`make_kjurf8` with :data:`KJURF8_KEY`); pass a custom callable to
+            target a different deployment's key.
 
     Returns a dict with the final ``body`` string and every intermediate layer
     (``json_bytes``, ``lzw``, ``pad``, ``plaintext_len``, ``rsa_block``, ``blob``) so
     the port can be verified layer-by-layer against the JS oracle.
     """
     if kjurf8 is None:
-        kjurf8 = lambda b: b  # noqa: E731 - identity hook
+        kjurf8 = make_kjurf8()
     if random_buffer is None:
         random_buffer = secrets.token_bytes(RSA_KEY_SIZE)
     if len(random_buffer) != RSA_KEY_SIZE:
@@ -826,10 +859,11 @@ class TurnstileSolver:
 #   2. The fingerprint bucket map must be enumerated/classified over a REAL browser
 #      global graph (aM/aP) -- it cannot be statically hardcoded like the JSD map and
 #      stay correct across UA/version.
-#   3. KJuRf8 (decoded.js:2884) is an external 16-byte transform on the XTEA key slice
-#      that is NOT defined in the captured bundle. `build_flow_ov_body` exposes it as
-#      an injectable hook (identity by default); resolve it from the companion script
-#      for a server-acceptable body.
+#   3. [DONE] KJuRf8 (decoded.js:2884) is a repeating-key XOR on the XTEA key slice.
+#      Resolved + verified against live ground truth; `make_kjurf8()` / KJURF8_KEY are
+#      the default. The key is built at runtime from the string-table (not a static
+#      literal), so for a new deployment re-extract it live via the CDP one-liner
+#      `KJuRf8(new Uint8Array(16))` and pass the bytes to `make_kjurf8`.
 #   4. _cf_chl_opt tokens (SvTRd8 / wKbN9 / TJERQ4) and the embedded <num>:<ts>:<token>
 #      triple are per-load; scrape them from the challenge page / iframe at solve time.
 # ===========================================================================
