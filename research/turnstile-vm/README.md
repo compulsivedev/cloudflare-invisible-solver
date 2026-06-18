@@ -60,6 +60,10 @@ node ../../.agents/skills/ast-deobfuscation/scripts/run-pipeline.js vm_raw.js ou
   ported to `utils/turnstile.py` (`build_flow_ov_body`), and verified byte-for-byte by
   `verify_body.py` across the serialize -> LZW -> pad -> XTEA -> RSA-prepend -> custom-b64
   chain (both the small `av`/`p3` and large `aG`/`p4` branches).
-- The only unresolved symbol is **`KJuRf8`** (decoded.js:2884), a 16-byte transform on
-  the XTEA key slice that is not defined in the captured bundle (an external/companion
-  global). The port exposes it as an injectable hook (identity by default).
+- **`KJuRf8`** (decoded.js:2884) — the 16-byte transform on the XTEA key slice — is
+  **resolved**: a repeating-key XOR whose key is assembled at runtime from the string
+  table (so it is not statically greppable in the bundle), recovered live by calling
+  `KJuRf8(new Uint8Array(16))` over CDP and verified against two independent `/flow/ov`
+  captures (both decrypt to identical, coherent LZW/JSON plaintext). The port carries
+  the captured key as `KJURF8_KEY` (`make_kjurf8`) and still exposes it as an injectable
+  hook so a new deployment can be re-probed.

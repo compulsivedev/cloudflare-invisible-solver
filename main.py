@@ -76,41 +76,64 @@ class CfSolver:
         cf_chl_opt: Dict[str, str],
         challenge_token: str,
         fingerprint: Dict[str, List[str]],
+        *,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Union[bool, str]:
-        """Turnstile submit pathway (SCAFFOLD), parallel to :meth:`get_solution`.
+        """Turnstile submit pathway, parallel to :meth:`get_solution`.
 
         Where the JSD path lz-string-encodes the fingerprint and POSTs to ``/jsd/r/``,
-        Turnstile hashes + RSA-wraps + custom-base64-encodes it and POSTs to ``/flow/ov``
-        (see utils/turnstile.py and research/turnstile-vm/). The fingerprint model and
-        every crypto primitive are recovered and verified, but the byte-exact request
-        *body* is assembled by the VM's JSVMP bytecode, so this cannot produce a passing
-        token from static recovery alone -- it wires what is recovered and marks the gap.
+        Turnstile serializes -> LZW -> XTEA -> RSA-1024-wraps -> custom-base64-encodes it
+        and POSTs to ``/flow/ov`` (see utils/turnstile.py and research/turnstile-vm/). The
+        fingerprint model, every crypto primitive, and the byte-exact body builder ``pZ``
+        are recovered and verified byte-for-byte (``turnstile.build_flow_ov_body``), so
+        this assembles the real request body and submits it.
+
+        A *passing* token still depends on caller-supplied per-load inputs that cannot be
+        recovered statically: a live env-probe ``fingerprint`` (TODO 2 in
+        utils/turnstile.py), the page's per-load ``cf_chl_opt`` tokens + ``challenge_token``
+        triple (TODO 4), and the VM-set ``cf-chl`` / ``cf-chl-ra`` request headers
+        (decoded.js:4836) passed via ``extra_headers``.
 
         Args:
             challenge_website: e.g. ``https://example.com``.
             cf_chl_opt: the page's ``_cf_chl_opt`` (needs ``SvTRd8``/``wKbN9``/``TJERQ4``).
             challenge_token: the per-load ``<num>:<ts>:<token>`` triple embedded in the VM.
             fingerprint: the env-probe bucket map (see TODO 2 in utils/turnstile.py).
+            extra_headers: per-load request headers the VM sets on the XHR (e.g.
+                ``cf-chl`` / ``cf-chl-ra``), merged onto the challenge headers.
+
+        Returns the ``/flow/ov`` response text on HTTP 200, else ``False``.
         """
+        session = self._create_session()
         submit_url = turnstile.build_flow_ov_url(
             challenge_website, cf_chl_opt, challenge_token
         )
-        recovered = turnstile.TurnstileSolver(fingerprint).build_submit_body()
+        body = turnstile.TurnstileSolver(fingerprint).build_submit_body()
 
         logger.info(
-            "Assembled recovered Turnstile payload pieces.",
+            "Submitting recovered Turnstile /flow/ov payload.",
             submit_url=submit_url[:50] + "...",
-            hash=recovered["hash"][:16] + "..",
+            body=body[:30] + "..",
+            body_len=len(body),
         )
 
-        # TODO(dynamic): the exact /flow/ov request body (field names/order + the
-        # symmetric encryption of the fingerprint/telemetry blob) is produced by the
-        # JSVMP bytecode interpreter and is not recovered statically. Lifting/executing
-        # that bytecode is required before this POST can yield a passing token.
-        raise NotImplementedError(
-            "Turnstile /flow/ov body assembly is JSVMP-driven; see TODOs in "
-            "utils/turnstile.py and research/turnstile-vm/TURNSTILE-ALGORITHM-RECOVERY.md"
+        session.headers = constants.CHALLENGE_HEADERS.copy()
+        session.headers["origin"] = challenge_website
+        if extra_headers:
+            session.headers.update(extra_headers)
+
+        response = session.post(submit_url, data=body)
+        if response.status_code == 200:
+            logger.info(
+                "Turnstile challenge submission accepted.",
+                status_code=response.status_code,
+            )
+            return response.text
+        logger.error(
+            "Error happened while submitting Turnstile challenge.",
+            status_code=response.status_code,
         )
+        return False
 
 
 if __name__ == "__main__":
