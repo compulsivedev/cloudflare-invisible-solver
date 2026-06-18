@@ -39,6 +39,18 @@ RECOVERED + VERIFIED byte-for-byte against the JS oracle
     * fingerprint value-classifier category model -> ``classify_value`` / ``CATEGORY``
     * /flow/ov endpoint construction            -> ``build_flow_ov_url``
 
+Exact INVERSES of the body chain (so a captured ``/flow/ov`` body can be decrypted
+and the genuine fingerprint plaintext recovered -- used as the Opt-1 validation gate
+and to validate any synthetic env-probe against live ground truth):
+    * custom-b64 decode    -> ``custom_b64decode``
+    * XTEA decrypt         -> ``_xtea_decrypt`` (and ``_xtea_decrypt_block``)
+    * LZW decompress       -> ``_lzw_decompress``
+    * full body parse      -> ``parse_flow_ov_body``
+RSA is one-way, so parsing requires the 128-byte ``p5`` buffer (captured live by
+hooking ``crypto.getRandomValues``) the XTEA key was sliced from. All inverses
+round-trip against their forward counterparts (research/turnstile-vm/verify_roundtrip.py)
+and decrypt real live bodies to the exact plaintext that rebuilds byte-for-byte.
+
 PER-LOAD / VERSION-PINNED -- the RSA modulus, ``aj`` alphabet and string-table
 rotation rotate across Turnstile versions and must be re-extracted from a fresh
 bundle (see ``research/turnstile-vm/`` and the TODOs in ``TurnstileSolver``).
@@ -371,6 +383,29 @@ def custom_b64encode(data: bytes) -> str:
     return "".join(out)
 
 
+def custom_b64decode(text: str, alphabet: Optional[str] = None) -> bytes:
+    """Inverse of :func:`custom_b64encode`: decode a custom-alphabet base64 string
+    (no padding char) back to bytes. ``alphabet`` defaults to the active
+    :data:`ALPHABET`. The trailing-group lengths mirror the encoder: 4 symbols ->
+    3 bytes, a final 3 symbols -> 2 bytes, a final 2 symbols -> 1 byte."""
+    alpha = alphabet if alphabet is not None else ALPHABET
+    idx = {c: i for i, c in enumerate(alpha)}
+    out = bytearray()
+    n = len(text)
+    full = (n // 4) * 4
+    for i in range(0, full, 4):
+        g = (idx[text[i]] << 18) | (idx[text[i + 1]] << 12) | (idx[text[i + 2]] << 6) | idx[text[i + 3]]
+        out += bytes(((g >> 16) & 0xFF, (g >> 8) & 0xFF, g & 0xFF))
+    rem = n - full
+    if rem == 2:
+        g = (idx[text[full]] << 18) | (idx[text[full + 1]] << 12)
+        out.append((g >> 16) & 0xFF)
+    elif rem == 3:
+        g = (idx[text[full]] << 18) | (idx[text[full + 1]] << 12) | (idx[text[full + 2]] << 6)
+        out += bytes(((g >> 16) & 0xFF, (g >> 8) & 0xFF))
+    return bytes(out)
+
+
 def sha256_hex(data: Union[str, bytes]) -> str:
     """SHA-256 hex digest. The VM ships a canonical ``binb_sha256`` (constants
     verified at decoded.js:9662-9663); ``hashlib`` is the byte-identical stdlib
@@ -605,6 +640,95 @@ def _lzw_compress(data: List[int]) -> List[int]:
     return out
 
 
+def _lzw_decompress(data: bytes) -> bytes:
+    """Inverse of :func:`_lzw_compress` (== lz-string ``decompressFromUint8Array``,
+    byte mode, 16-bit words MSB-first). ``data`` is the compressed byte stream;
+    returns the original byte payload.
+
+    Verified round-trip against :func:`_lzw_compress` over 600 random + JSON-ish
+    cases, and against live ``/flow/ov`` captures (decrypts to the VM's exact
+    plaintext). See research/turnstile-vm and the Opt-1 validation harness.
+    """
+    n = len(data) // 2
+    words = [(data[i * 2] << 8) | data[i * 2 + 1] for i in range(n)]
+    reset_value = 32768
+
+    state = {"val": words[0] if n else 0, "pos": reset_value, "idx": 1}
+
+    def read_bits(nbits: int) -> int:
+        bits = 0
+        maxpower = 1 << nbits
+        power = 1
+        while power != maxpower:
+            resb = state["val"] & state["pos"]
+            state["pos"] >>= 1
+            if state["pos"] == 0:
+                state["pos"] = reset_value
+                state["val"] = words[state["idx"]] if state["idx"] < n else 0
+                state["idx"] += 1
+            bits |= (1 if resb > 0 else 0) * power
+            power <<= 1
+        return bits
+
+    dictionary: List[Any] = [0, 1, 2]
+    enlarge_in = 4
+    dict_size = 4
+    num_bits = 3
+    result = bytearray()
+
+    c = read_bits(2)
+    if c == 2:
+        return b""
+    if c == 0:
+        ch = read_bits(8)
+    elif c == 1:
+        ch = read_bits(16)
+    else:
+        raise ValueError("invalid LZW stream header")
+    dictionary.append(bytes([ch]))
+    w = bytes([ch])
+    result += w
+
+    while True:
+        if state["idx"] > n:
+            return b""
+        c = read_bits(num_bits)
+        if c == 0:
+            ch = read_bits(8)
+            dictionary.append(bytes([ch]))
+            c = dict_size
+            dict_size += 1
+            enlarge_in -= 1
+        elif c == 1:
+            ch = read_bits(16)
+            dictionary.append(bytes([ch]))
+            c = dict_size
+            dict_size += 1
+            enlarge_in -= 1
+        elif c == 2:
+            return bytes(result)
+
+        if enlarge_in == 0:
+            enlarge_in = 1 << num_bits
+            num_bits += 1
+
+        if c < len(dictionary):
+            entry = dictionary[c]
+        elif c == dict_size:
+            entry = w + w[:1]
+        else:
+            raise ValueError("invalid LZW code")
+
+        result += entry
+        dictionary.append(w + entry[:1])
+        dict_size += 1
+        enlarge_in -= 1
+        w = entry
+        if enlarge_in == 0:
+            enlarge_in = 1 << num_bits
+            num_bits += 1
+
+
 def _xtea_round_keys(words: tuple) -> List[int]:
     """``p0`` (decoded.js:4004): expand 4 key words into 64 XTEA subkeys
     (``sum + key[sum & 3]`` / ``sum + key[(sum >> 11) & 3]``, delta 0x9E3779B9)."""
@@ -661,6 +785,50 @@ def _xtea_encrypt(plaintext: bytes, base_keys: List[int]) -> bytes:
         out += bytes((
             (c0 >> 24) & 0xFF, (c0 >> 16) & 0xFF, (c0 >> 8) & 0xFF, c0 & 0xFF,
             (c1 >> 24) & 0xFF, (c1 >> 16) & 0xFF, (c1 >> 8) & 0xFF, c1 & 0xFF,
+        ))
+    return bytes(out)
+
+
+def _xtea_decrypt_block(v0: int, v1: int, subkeys: List[int]) -> tuple:
+    """Inverse of :func:`_xtea_encrypt_block`: undo the 32 XTEA rounds.
+
+    The forward cipher accumulates ``v0``/``v1`` as unreduced ints, but each round's
+    delta and the final output depend only on the low 32 bits, so the transform is
+    standard XTEA modulo 2**32 and inverts exactly in 32-bit modular arithmetic.
+    """
+    def f(x: int) -> int:
+        return ((((x << 4) & _U32) ^ (x >> 5)) + x) & _U32
+
+    v0 &= _U32
+    v1 &= _U32
+    i = len(subkeys) - 1  # 63
+    for _ in range(32):
+        v1 = (v1 - ((f(v0) ^ subkeys[i]) & _U32)) & _U32
+        i -= 1
+        v0 = (v0 - ((f(v1) ^ subkeys[i]) & _U32)) & _U32
+        i -= 1
+    return v0, v1
+
+
+def _xtea_decrypt(ciphertext: bytes, base_keys: List[int]) -> bytes:
+    """Inverse of :func:`_xtea_encrypt`: decrypt the block-by-block ciphertext using
+    the same per-block subkey schedule (``(off >> 3) & 255``)."""
+    if len(ciphertext) % 8:
+        raise ValueError("XTEA ciphertext length must be a multiple of 8")
+    out = bytearray()
+    cache: Dict[int, List[int]] = {}
+    for off in range(0, len(ciphertext), 8):
+        bi = (off >> 3) & 0xFF
+        sub = cache.get(bi)
+        if sub is None:
+            sub = _xtea_block_keys(base_keys, bi)
+            cache[bi] = sub
+        v0 = (ciphertext[off] << 24) | (ciphertext[off + 1] << 16) | (ciphertext[off + 2] << 8) | ciphertext[off + 3]
+        v1 = (ciphertext[off + 4] << 24) | (ciphertext[off + 5] << 16) | (ciphertext[off + 6] << 8) | ciphertext[off + 7]
+        p0, p1 = _xtea_decrypt_block(v0, v1, sub)
+        out += bytes((
+            (p0 >> 24) & 0xFF, (p0 >> 16) & 0xFF, (p0 >> 8) & 0xFF, p0 & 0xFF,
+            (p1 >> 24) & 0xFF, (p1 >> 16) & 0xFF, (p1 >> 8) & 0xFF, p1 & 0xFF,
         ))
     return bytes(out)
 
@@ -763,6 +931,83 @@ def build_flow_ov_body(
         "rsa_block": bytes(pv),
         "blob": blob,
     }
+
+
+def parse_flow_ov_body(
+    body: str,
+    *,
+    random_buffer: bytes,
+    kjurf8: Optional[Any] = None,
+    alphabet: Optional[str] = None,
+    parse_json: bool = True,
+) -> Dict[str, Any]:
+    """Inverse of :func:`build_flow_ov_body`: recover the fingerprint plaintext from a
+    captured ``/flow/ov`` body string.
+
+    RSA is one-way without the server's private key, so the 128-byte random buffer
+    ``p5`` (``random_buffer``) must be supplied out of band -- e.g. captured live by
+    hooking ``crypto.getRandomValues`` -- exactly as it was when the body was built.
+    The XTEA key is then sliced from ``p5`` the same way the forward path slices it
+    (using the pad-count byte carried in the blob), so the decrypt is fully
+    determined.
+
+    Args:
+        body: the custom-b64 ``/flow/ov`` body string.
+        random_buffer: the 128-byte ``p5`` buffer used when the body was built
+            (``p5[0]`` is forced to 0 here, matching the VM post-RSA reset).
+        kjurf8: the 16-byte XTEA-key transform (defaults to :func:`make_kjurf8`).
+        alphabet: custom-b64 alphabet (defaults to the active :data:`ALPHABET`).
+        parse_json: when True, ``fingerprint`` is ``json.loads``-ed; otherwise the
+            raw decompressed bytes are returned under ``json_bytes`` only.
+
+    Returns a dict with every recovered layer (``blob``, ``rsa_block``, ``pad``,
+    ``ciphertext``, ``plaintext``, ``lzw``, ``json_bytes`` and, if requested,
+    ``fingerprint``) -- symmetric with the layers :func:`build_flow_ov_body` emits.
+    """
+    if kjurf8 is None:
+        kjurf8 = make_kjurf8()
+    if len(random_buffer) != RSA_KEY_SIZE:
+        raise ValueError(f"random_buffer must be {RSA_KEY_SIZE} bytes")
+    p5 = bytearray(random_buffer)
+    p5[0] = 0
+
+    blob = custom_b64decode(body, alphabet)
+    if len(blob) < RSA_KEY_SIZE + 1:
+        raise ValueError("body too short to contain RSA block + pad byte")
+    rsa_block_bytes = blob[:RSA_KEY_SIZE]
+    pad = blob[RSA_KEY_SIZE]
+    ciphertext = blob[RSA_KEY_SIZE + 1:]
+
+    off = 9 * pad + 40
+    key16 = kjurf8(bytes(p5[off:off + 16]))
+    if len(key16) != 16:
+        raise ValueError("KJuRf8 must return 16 bytes")
+    words = (
+        int.from_bytes(key16[0:4], "big"),
+        int.from_bytes(key16[4:8], "big"),
+        int.from_bytes(key16[8:12], "big"),
+        int.from_bytes(key16[12:16], "big"),
+    )
+    base_keys = _xtea_round_keys(words)
+
+    plaintext = _xtea_decrypt(ciphertext, base_keys)
+    lzw = plaintext[:len(plaintext) - pad] if pad else plaintext
+    json_bytes = _lzw_decompress(lzw)
+
+    result: Dict[str, Any] = {
+        "blob": blob,
+        "rsa_block": rsa_block_bytes,
+        "pad": pad,
+        "ciphertext": ciphertext,
+        "plaintext": plaintext,
+        "lzw": lzw,
+        "json_bytes": json_bytes,
+    }
+    if parse_json:
+        # the builder appends exactly one trailing 0x20 byte after the serialized JSON
+        payload = json_bytes[:-1] if json_bytes.endswith(b"\x20") else json_bytes
+        result["fingerprint"] = json.loads(payload.decode("utf-8"))
+    return result
 
 
 # ---------------------------------------------------------------------------
