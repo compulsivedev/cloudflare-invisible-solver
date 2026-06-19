@@ -141,6 +141,36 @@ class CfSolver:
             extra_headers=extra_headers,
         )
 
+    def solve_turnstile_browser(
+        self,
+        sitekey: str,
+        *,
+        host: str = "www.tickpick.com",
+        action: Optional[str] = None,
+        cdata: Optional[str] = None,
+        headless: bool = False,
+        timeout: float = 60.0,
+    ) -> str:
+        """Return a **valid** ``cf-turnstile-response`` token by running CF's VM in Chrome.
+
+        Invisible Turnstile scores the submission server-side on the live browser
+        environment, so the synthetic ``/flow/ov`` body in :meth:`solve_turnstile`
+        cannot yield a token that validates. This drives a stealth Chrome via zendriver
+        (CDP), renders the widget for ``sitekey`` on ``host`` (the document is injected,
+        so the sitekey's hostname check passes), and reads back the issued token. See
+        :mod:`utils.turnstile_browser`.
+        """
+        from utils.turnstile_browser import solve_turnstile_browser
+
+        return solve_turnstile_browser(
+            sitekey,
+            host=host,
+            action=action,
+            cdata=cdata,
+            headless=headless,
+            timeout=timeout,
+        )
+
     def get_turnstile_solution(
         self,
         challenge_website: str,
