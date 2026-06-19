@@ -5,7 +5,8 @@ import structlog
 from curl_cffi import requests
 
 from utils.fingerprint import create_wb_result
-from utils import constants, turnstile
+from utils import constants, turnstile, turnstile_scraper
+from utils.turnstile_scraper import TurnstileChallenge
 
 logger = structlog.get_logger()
 
@@ -94,6 +95,82 @@ class CfSolver:
             challenge_website, cdp_url=cdp_url, roots=roots
         )
 
+    def scrape_turnstile_challenge(
+        self,
+        sitekey: str,
+        page_url: str,
+        **kwargs: object,
+    ) -> TurnstileChallenge:
+        """HTTP-scrape a widget's per-load ``_cf_chl_opt`` tokens + challenge triple (TODO 4).
+
+        Fetches the Turnstile challenge iframe over HTTP (no browser) and returns a
+        :class:`~utils.turnstile_scraper.TurnstileChallenge` carrying ``SvTRd8`` /
+        ``wKbN9`` / ``TJERQ4``, the ``<num>:<ts>:<token>`` triple, and the ``cf-chl`` /
+        ``cf-chl-ra`` headers -- the inputs :meth:`get_turnstile_solution` used to need
+        hand-supplied. ``page_url`` is sent as ``Referer`` and must be an origin the
+        sitekey is allowlisted for. Extra keyword args pass through to
+        :func:`utils.turnstile_scraper.scrape_turnstile_tokens`.
+        """
+        return turnstile_scraper.scrape_turnstile_tokens(
+            sitekey, page_url=page_url, **kwargs
+        )
+
+    def solve_turnstile(
+        self,
+        sitekey: str,
+        page_url: str,
+        fingerprint: Dict[str, List[str]],
+        *,
+        challenge: Optional[TurnstileChallenge] = None,
+    ) -> Union[bool, str]:
+        """End-to-end Turnstile solve: scrape per-load tokens (TODO 4) then submit ``/flow/ov``.
+
+        Wires :meth:`scrape_turnstile_challenge` into :meth:`get_turnstile_solution` so a
+        caller only needs the ``sitekey``, the embedding ``page_url``, and a live
+        ``fingerprint``. Pass a pre-scraped ``challenge`` to reuse one load. The submit
+        target is ``challenges.cloudflare.com`` (where the widget POSTs), not ``page_url``.
+        """
+        if challenge is None:
+            challenge = self.scrape_turnstile_challenge(sitekey, page_url)
+        cf_chl_opt, challenge_token, extra_headers = challenge.solution_inputs()
+        return self.get_turnstile_solution(
+            turnstile_scraper.TURNSTILE_HOST,
+            cf_chl_opt,
+            challenge_token,
+            fingerprint,
+            extra_headers=extra_headers,
+        )
+
+    def solve_turnstile_browser(
+        self,
+        sitekey: str,
+        *,
+        host: str = "www.tickpick.com",
+        action: Optional[str] = None,
+        cdata: Optional[str] = None,
+        headless: bool = False,
+        timeout: float = 60.0,
+    ) -> str:
+        """Return a **valid** ``cf-turnstile-response`` token by running CF's VM in Chrome.
+
+        Invisible Turnstile scores the submission server-side on the live browser
+        environment, so the synthetic ``/flow/ov`` body in :meth:`solve_turnstile`
+        cannot yield a token that validates. This drives a stealth Chrome via zendriver
+        (CDP), renders the widget for ``sitekey`` on ``host`` (the document is injected,
+        so the sitekey's hostname check passes), and reads back the issued token. See
+        :mod:`utils.turnstile_browser`.
+        """
+        from utils.turnstile_browser import solve_turnstile_browser
+
+        return solve_turnstile_browser(
+            sitekey,
+            host=host,
+            action=action,
+            cdata=cdata,
+            headless=headless,
+            timeout=timeout,
+        )
+
     def get_turnstile_solution(
         self,
         challenge_website: str,
@@ -112,11 +189,13 @@ class CfSolver:
         are recovered and verified byte-for-byte (``turnstile.build_flow_ov_body``), so
         this assembles the real request body and submits it.
 
-        A *passing* token still depends on caller-supplied per-load inputs that cannot be
-        recovered statically: a live env-probe ``fingerprint`` (TODO 2 in
-        utils/turnstile.py), the page's per-load ``cf_chl_opt`` tokens + ``challenge_token``
-        triple (TODO 4), and the VM-set ``cf-chl`` / ``cf-chl-ra`` request headers
-        (decoded.js:4836) passed via ``extra_headers``.
+        The per-load ``cf_chl_opt`` tokens + ``challenge_token`` triple and the VM-set
+        ``cf-chl`` / ``cf-chl-ra`` headers (decoded.js:4836) can now be HTTP-scraped via
+        :meth:`scrape_turnstile_challenge` -- use :meth:`solve_turnstile` to wire that in
+        automatically (TODO 4). A *passing* token additionally needs a live env-probe
+        ``fingerprint`` (TODO 2 in utils/turnstile.py) and, because Cloudflare re-obfuscates
+        the VM per request, per-load crypto constants (alphabet + ``KJuRf8`` key) that the
+        captured ``DEFAULT_CONSTANTS`` will not match for an arbitrary live load.
 
         Args:
             challenge_website: e.g. ``https://example.com``.

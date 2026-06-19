@@ -1147,6 +1147,12 @@ class TurnstileSolver:
 #      static literal), so the AST extractor cannot recover it: for a new deployment
 #      re-probe it live via `KJuRf8(new Uint8Array(16))` and pass the bytes as
 #      `TurnstileConstants(..., kjurf8_key=...)` (or `make_kjurf8(bytes)` directly).
-#   4. _cf_chl_opt tokens (SvTRd8 / wKbN9 / TJERQ4) and the embedded <num>:<ts>:<token>
-#      triple are per-load; scrape them from the challenge page / iframe at solve time.
+#   4. [DONE] _cf_chl_opt tokens (SvTRd8 / wKbN9 / TJERQ4) and the embedded
+#      <num>:<ts>:<token> triple are per-load. utils.turnstile_scraper fetches the
+#      challenge iframe over HTTP (curl_cffi, no browser) and parses them out, plus the
+#      cf-chl / cf-chl-ra headers; CfSolver.solve_turnstile() wires this into the submit
+#      path so the caller only needs the sitekey + embedding page_url + a fingerprint.
+#      NOTE: Cloudflare re-obfuscates the VM per request (the string table is re-shuffled
+#      each serve), so the alphabet + KJuRf8 key for an arbitrary live load differ from
+#      DEFAULT_CONSTANTS and (1)/(3) above must be re-resolved from *that* load's bundle.
 # ===========================================================================
